@@ -1,0 +1,19 @@
+﻿# Visual Studio GitIgnore
+.vs/
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+*.user
+*.aps
+*.pdb
+*.log
+*.obj
+*.tlog
+*.lastbuildstate
+*.idb
+*.ipch
+*.res
+*.pch
+*.iobj
+*.ipdb
