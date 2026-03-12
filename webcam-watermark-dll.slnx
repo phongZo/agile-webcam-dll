@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="webcam-watermark-dll.vcxproj" Id="a3e425f9-f7f2-4d90-9381-5c6447805417" />
+</Solution>
