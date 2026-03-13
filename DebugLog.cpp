@@ -32,19 +32,32 @@ void DebugLog::initialize() {
 		processName = procName;
 
 		char path[MAX_PATH];
-		if (SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_APPDATA, NULL, 0, path))) {
-			// Change log name for webcam dll
-			logFilePath = std::string(path) + "\\AgileMark\\webcam_dll.txt";
+		bool pathFound = false;
+
+		// Try environment variable first (more robust in services)
+		if (GetEnvironmentVariableA("ProgramData", path, MAX_PATH) > 0) {
+			pathFound = true;
+		}
+		else if (SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_COMMON_APPDATA, NULL, 0, path))) {
+			pathFound = true;
+		}
+
+		if (pathFound) {
+			std::string baseDir = std::string(path) + "\\AgileMark";
+			CreateDirectoryA(baseDir.c_str(), NULL);
+			
+			logFilePath = baseDir + "\\webcam_dll.txt";
 
 			logFile.open(logFilePath, std::ios::out | std::ios::app);
 			if (!logFile.is_open()) {
-				logFile.open(logFilePath, std::ios::out);
-				if (logFile.is_open()) {
-					logFile.close();
-					logFile.open(logFilePath, std::ios::out | std::ios::app);
-				}
+				// Fallback to a simple name in C:\ if possible or just use OutputDebugString
+				OutputDebugStringA("[WebcamDLL] Failed to open log file in ProgramData.");
 			}
 		}
+		
+		std::string startMsg = "[WebcamDLL] Initialized in " + processName + " (PID: " + std::to_string(processID) + ")";
+		OutputDebugStringA(startMsg.c_str());
+		
 		initialized = true;
 	}
 }
@@ -54,16 +67,20 @@ void DebugLog::log(const std::string& message) {
 		initialize();
 	}
 
-	if (logFile.is_open()) {
-		auto now = std::chrono::system_clock::now();
-		auto in_time_t = std::chrono::system_clock::to_time_t(now);
-		struct tm timeinfo;
-		localtime_s(&timeinfo, &in_time_t);
-		std::stringstream ss;
-		ss << std::put_time(&timeinfo, "%Y-%m-%d %X");
+	auto now = std::chrono::system_clock::now();
+	auto in_time_t = std::chrono::system_clock::to_time_t(now);
+	struct tm timeinfo;
+	localtime_s(&timeinfo, &in_time_t);
+	std::stringstream ss;
+	ss << std::put_time(&timeinfo, "%Y-%m-%d %X");
 
-		logFile << "[" << ss.str() << "] "
-			<< "[" << processName << " " << processID << "] "
-			<< message << std::endl;
+	std::string formatted = "[" + ss.str() + "] [" + processName + " " + std::to_string(processID) + "] " + message;
+	
+	// Always output to debugger (can be seen with DebugView)
+	OutputDebugStringA(formatted.c_str());
+
+	if (logFile.is_open()) {
+		logFile << formatted << std::endl;
+		logFile.flush(); // Force write to disk
 	}
 }
