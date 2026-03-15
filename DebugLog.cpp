@@ -34,11 +34,11 @@ void DebugLog::initialize() {
 		char path[MAX_PATH];
 		bool pathFound = false;
 
-		// Try environment variable first (more robust in services)
-		if (GetEnvironmentVariableA("ProgramData", path, MAX_PATH) > 0) {
+		// Use APPDATA for Roaming profile
+		if (GetEnvironmentVariableA("APPDATA", path, MAX_PATH) > 0) {
 			pathFound = true;
 		}
-		else if (SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_COMMON_APPDATA, NULL, 0, path))) {
+		else if (SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_APPDATA, NULL, 0, path))) {
 			pathFound = true;
 		}
 
@@ -46,12 +46,11 @@ void DebugLog::initialize() {
 			std::string baseDir = std::string(path) + "\\AgileMark";
 			CreateDirectoryA(baseDir.c_str(), NULL);
 			
-			logFilePath = baseDir + "\\webcam_dll.txt";
+			logFilePath = baseDir + "\\webcam_dll.log";
 
 			logFile.open(logFilePath, std::ios::out | std::ios::app);
 			if (!logFile.is_open()) {
-				// Fallback to a simple name in C:\ if possible or just use OutputDebugString
-				OutputDebugStringA("[WebcamDLL] Failed to open log file in ProgramData.");
+				OutputDebugStringA("[WebcamDLL] Failed to open log file in Roaming AppData.");
 			}
 		}
 		

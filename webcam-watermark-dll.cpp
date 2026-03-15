@@ -1,27 +1,16 @@
 #include "pch.h"
 #include <windows.h>
 #include <string>
-#include <map>
-#include <mutex>
-#include <vector>
 #include <atomic>
+#include <mutex>
 #include <dshow.h>
-#include <dvdmedia.h>
-#include <mfapi.h>
-#include <mfidl.h>
-#include <mfreadwrite.h>
-#include <mferror.h>
 #include <tlhelp32.h>
 #include <psapi.h>
 #include "DebugLog.h"
 #include "../packages/minhook.1.3.3/lib/native/include/MinHook.h"
 
-// --- LINKER LIBRARIES ---
 #pragma comment(lib, "strmiids.lib")
 #pragma comment(lib, "ole32.lib")
-#pragma comment(lib, "mfplat.lib")
-#pragma comment(lib, "mfreadwrite.lib")
-#pragma comment(lib, "mfuuid.lib")
 
 #ifdef _WIN64
     #pragma comment(lib, "../packages/minhook.1.3.3/lib/native/lib/libMinHook-x64-v141-mt.lib")
@@ -32,178 +21,169 @@
 // --- Global State ---
 static HINSTANCE g_hModule = NULL;
 static std::atomic<bool> g_bUnloading(false);
-static std::atomic<int> g_activeCalls(0); 
 static std::atomic<bool> g_bInitialized(false);
+static std::atomic<bool> g_bReceiveHooked(false);
+static std::mutex g_hookMutex;
+static std::mutex g_drawMutex;
 
-// --- MF Interface Typedefs ---
-typedef HRESULT(WINAPI* PMFCreateSourceReaderFromMediaSource)(IMFMediaSource*, IMFAttributes*, IMFSourceReader**);
-static PMFCreateSourceReaderFromMediaSource g_origMFCreateSourceReaderMS = NULL;
+// --- Typedefs ---
+typedef HRESULT(WINAPI* PCoCreateInstance)(REFCLSID, LPUNKNOWN, DWORD, REFIID, LPVOID*);
+static PCoCreateInstance g_origCoCreateInstance = NULL;
 
-typedef HRESULT(WINAPI* PMFCreateSourceReaderFromUnknown)(IUnknown*, IMFAttributes*, IMFSourceReader**);
-static PMFCreateSourceReaderFromUnknown g_origMFCreateSourceReaderUnk = NULL;
+typedef HRESULT(STDMETHODCALLTYPE* PGraphConnect)(IGraphBuilder*, IPin*, IPin*);
+static PGraphConnect g_origGraphConnect = NULL;
 
-typedef HRESULT(WINAPI* PMFCreateSourceReaderFromByteStream)(IMFByteStream*, IMFAttributes*, IMFSourceReader**);
-static PMFCreateSourceReaderFromByteStream g_origMFCreateSourceReaderBS = NULL;
+typedef HRESULT(STDMETHODCALLTYPE* PReceive)(IMemInputPin*, IMediaSample*);
+static PReceive g_origReceive = NULL;
 
-typedef HRESULT(WINAPI* PMFCreateDeviceSource)(IMFAttributes*, IMFMediaSource**);
-static PMFCreateDeviceSource g_origMFCreateDeviceSource = NULL;
+// --- AGILEMARK Standard Bitmap Font 8x8 ---
+static unsigned char g_agilemark_font[9][8] = {
+    {0x18, 0x3C, 0x66, 0x66, 0x7E, 0x66, 0x66, 0x00}, // A
+    {0x3C, 0x66, 0x60, 0x6E, 0x66, 0x66, 0x3C, 0x00}, // G
+    {0x3C, 0x18, 0x18, 0x18, 0x18, 0x18, 0x3C, 0x00}, // I
+    {0x60, 0x60, 0x60, 0x60, 0x60, 0x60, 0x7E, 0x00}, // L
+    {0x7E, 0x60, 0x60, 0x78, 0x60, 0x60, 0x7E, 0x00}, // E
+    {0x66, 0x7E, 0x7E, 0x66, 0x66, 0x66, 0x66, 0x00}, // M
+    {0x18, 0x3C, 0x66, 0x66, 0x7E, 0x66, 0x66, 0x00}, // A
+    {0x7C, 0x66, 0x66, 0x7C, 0x78, 0x66, 0x66, 0x00}, // R
+    {0x66, 0x6C, 0x78, 0x70, 0x78, 0x6C, 0x66, 0x00}  // K
+};
 
-typedef HRESULT(STDMETHODCALLTYPE* POnReadSample)(IMFSourceReaderCallback*, HRESULT, DWORD, DWORD, LONGLONG, IMFSample*);
-static POnReadSample g_origOnReadSample = NULL;
+// --- YUY2 Drawing Engine ---
+void DrawAgileMarkStyle(BYTE* pData, int width, int height, int base_x, int base_y, BYTE Y, BYTE U, BYTE V) {
+    int stride = width * 2;
+    // Vẽ chữ AGILEMARK nghiêng nhẹ bằng cách tịnh tiến y theo x
+    for (int i = 0; i < 9; i++) {
+        int char_x = base_x + i * 14;
+        int char_y = base_y + i * 4; // Tạo độ nghiêng cho dòng chữ
 
-// --- Helper: Draw Grid on Frame ---
-void DrawGridPattern(BYTE* pData, int width, int height, long stride) {
-    for (int y = 0; y < height; y += 50) {
-        memset(pData + (y * stride), 255, (width < stride) ? width : stride);
-    }
-    for (int x = 0; x < width; x += 50) {
-        for (int y = 0; y < height; y++) {
-            pData[y * stride + x] = 255;
-        }
-    }
-}
-
-void ProcessMFSample(IMFSample* pSample) {
-    if (!pSample || g_bUnloading.load()) return;
-    g_activeCalls++;
-    IMFMediaBuffer* pBuffer = NULL;
-    if (SUCCEEDED(pSample->ConvertToContiguousBuffer(&pBuffer))) {
-        BYTE* pData = NULL; LONG lStride = 0; DWORD cbCurrent = 0;
-        IMF2DBuffer* p2DBuffer = NULL;
-        if (SUCCEEDED(pBuffer->QueryInterface(IID_IMF2DBuffer, (void**)&p2DBuffer))) {
-            if (SUCCEEDED(p2DBuffer->Lock2D(&pData, &lStride))) {
-                DrawGridPattern(pData, (int)abs(lStride), 480, lStride);
-                p2DBuffer->Unlock2D();
+        for (int r = 0; r < 8; r++) {
+            for (int c = 0; c < 8; c++) {
+                if (g_agilemark_font[i][r] & (0x80 >> c)) {
+                    // Phóng to pixel 2x2
+                    for (int dy = 0; dy < 2; dy++) {
+                        for (int dx = 0; dx < 2; dx++) {
+                            int px = char_x + c * 2 + dx;
+                            int py = char_y + r * 2 + dy;
+                            if (px >= 0 && px < width && py >= 0 && py < height) {
+                                int pos = py * stride + px * 2;
+                                pData[pos] = Y;
+                                int uv_pos = py * stride + (px & ~1) * 2 + 1;
+                                if (uv_pos + 2 < width * height * 2) {
+                                    pData[uv_pos] = U; pData[uv_pos + 2] = V;
+                                }
+                            }
+                        }
+                    }
+                }
             }
-            p2DBuffer->Release();
-        } else if (SUCCEEDED(pBuffer->Lock(&pData, NULL, &cbCurrent))) {
-            DrawGridPattern(pData, 640, 480, 640);
-            pBuffer->Unlock();
         }
-        pBuffer->Release();
     }
-    g_activeCalls--;
 }
 
-// --- Hooks Implementation ---
-HRESULT STDMETHODCALLTYPE HookedOnReadSample(IMFSourceReaderCallback* pSelf, HRESULT hrStatus, DWORD dwStreamIndex, DWORD dwStreamFlags, LONGLONG llTimestamp, IMFSample* pSample) {
-    if (SUCCEEDED(hrStatus) && pSample) ProcessMFSample(pSample);
-    return g_origOnReadSample(pSelf, hrStatus, dwStreamIndex, dwStreamFlags, llTimestamp, pSample);
+void ProcessWatermarkMaster(BYTE* pData, long size, int width, int height) {
+    if (!pData || size < (width * height * 2)) return;
+    std::lock_guard<std::mutex> lock(g_drawMutex);
+
+    BYTE Y = 76, U = 84, V = 255; // Red Color
+
+    // Vẽ lưới AGILEMARK chuẩn Master
+    int stepX = 250;
+    int stepY = 180;
+
+    for (int y = -100; y < height; y += stepY) {
+        for (int x = -100; x < width; x += stepX) {
+            DrawAgileMarkStyle(pData, width, height, x, y, Y, U, V);
+        }
+    }
 }
 
-void HookSourceReader(IMFSourceReader* pReader, IMFAttributes* pAttributes) {
-    if (!pReader) return;
-    if (pAttributes) {
-        IUnknown* pUnkCallback = NULL;
-        if (SUCCEEDED(pAttributes->GetUnknown(MF_SOURCE_READER_ASYNC_CALLBACK, IID_IUnknown, (LPVOID*)&pUnkCallback))) {
-            void** vtable = *(void***)pUnkCallback;
-            if (MH_CreateHook(vtable[3], &HookedOnReadSample, (LPVOID*)&g_origOnReadSample) == MH_OK) {
-                MH_EnableHook(vtable[3]);
-                DebugLog::log("[WebcamDLL] Hooked Async Callback");
+// --- Hook Implementations ---
+HRESULT STDMETHODCALLTYPE HookedReceive(IMemInputPin* pSelf, IMediaSample* pSample) {
+    if (pSample && !g_bUnloading.load()) {
+        BYTE* pBuffer = NULL;
+        if (SUCCEEDED(pSample->GetPointer(&pBuffer))) {
+            long actualLen = pSample->GetActualDataLength();
+            int w = 640, h = 480;
+            if (actualLen >= 1280 * 720 * 2) { w = 1280; h = 720; }
+            ProcessWatermarkMaster(pBuffer, actualLen, w, h);
+        }
+    }
+    return g_origReceive(pSelf, pSample);
+}
+
+void HookMemInputSafe(IMemInputPin* pMemInput) {
+    if (!pMemInput) return;
+    std::lock_guard<std::mutex> lock(g_hookMutex);
+    if (g_bReceiveHooked.load()) return;
+
+    void** vtable = *(void***)pMemInput;
+    if (MH_CreateHook(vtable[6], &HookedReceive, (LPVOID*)&g_origReceive) == MH_OK) {
+        MH_EnableHook(vtable[6]);
+        g_bReceiveHooked = true;
+        DebugLog::log("[WebcamDLL] Master AGILEMARK Style Active");
+    }
+}
+
+HRESULT STDMETHODCALLTYPE HookedGraphConnect(IGraphBuilder* pSelf, IPin* pOut, IPin* pIn) {
+    HRESULT hr = g_origGraphConnect(pSelf, pOut, pIn);
+    if (SUCCEEDED(hr)) {
+        IMemInputPin* pMemInput = NULL;
+        if (SUCCEEDED(pIn->QueryInterface(IID_IMemInputPin, (void**)&pMemInput))) {
+            HookMemInputSafe(pMemInput);
+            pMemInput->Release();
+        }
+    }
+    return hr;
+}
+
+HRESULT WINAPI HookedCoCreateInstance(REFCLSID rclsid, LPUNKNOWN pUnkOuter, DWORD dwClsContext, REFIID riid, LPVOID* ppv) {
+    HRESULT hr = g_origCoCreateInstance(rclsid, pUnkOuter, dwClsContext, riid, ppv);
+    if (SUCCEEDED(hr) && ppv && *ppv) {
+        if (riid == IID_IGraphBuilder || riid == IID_IFilterGraph) {
+            void** vtable = *(void***)*ppv;
+            std::lock_guard<std::mutex> lock(g_hookMutex);
+            if (MH_CreateHook(vtable[11], &HookedGraphConnect, (LPVOID*)&g_origGraphConnect) == MH_OK) {
+                MH_EnableHook(vtable[11]);
             }
-            pUnkCallback->Release();
         }
     }
-}
-
-HRESULT WINAPI HookedMFCreateSourceReaderFromMediaSource(IMFMediaSource* pMS, IMFAttributes* pAttr, IMFSourceReader** ppSR) {
-    HRESULT hr = g_origMFCreateSourceReaderMS(pMS, pAttr, ppSR);
-    if (SUCCEEDED(hr) && ppSR && *ppSR) HookSourceReader(*ppSR, pAttr);
     return hr;
 }
 
-HRESULT WINAPI HookedMFCreateSourceReaderFromUnknown(IUnknown* pUnk, IMFAttributes* pAttr, IMFSourceReader** ppSR) {
-    HRESULT hr = g_origMFCreateSourceReaderUnk(pUnk, pAttr, ppSR);
-    if (SUCCEEDED(hr) && ppSR && *ppSR) HookSourceReader(*ppSR, pAttr);
-    return hr;
-}
-
-HRESULT WINAPI HookedMFCreateSourceReaderFromByteStream(IMFByteStream* pBS, IMFAttributes* pAttr, IMFSourceReader** ppSR) {
-    HRESULT hr = g_origMFCreateSourceReaderBS(pBS, pAttr, ppSR);
-    if (SUCCEEDED(hr) && ppSR && *ppSR) HookSourceReader(*ppSR, pAttr);
-    return hr;
-}
-
-HRESULT WINAPI HookedMFCreateDeviceSource(IMFAttributes* pAttr, IMFMediaSource** ppMS) {
-    HRESULT hr = g_origMFCreateDeviceSource(pAttr, ppMS);
-    if (SUCCEEDED(hr)) DebugLog::log("[WebcamDLL] Device Source created");
-    return hr;
-}
-
-// --- Watchdog & Unload ---
-static bool IsAgileMarkPresent() {
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snap == INVALID_HANDLE_VALUE) return true;
-    PROCESSENTRY32W pe{ sizeof(pe) };
-    bool found = false;
-    if (Process32FirstW(snap, &pe)) {
-        do { 
-            if (_wcsicmp(pe.szExeFile, L"AgileMark.exe") == 0 || _wcsicmp(pe.szExeFile, L"WebcamWatermark.exe") == 0) {
-                found = true; break; 
-            } 
-        } while (Process32NextW(snap, &pe));
-    }
-    CloseHandle(snap);
-    return found;
-}
-
-void InitiateHardUnload() {
-    if (g_bUnloading.exchange(true)) return;
-    MH_DisableHook(MH_ALL_HOOKS);
-    Sleep(1000);
-    MH_Uninitialize();
-    DebugLog::log("[WebcamDLL] Safe unload complete.");
-    FreeLibraryAndExitThread(g_hModule, 0);
-}
-
+// --- Watchdog ---
 DWORD WINAPI WatchdogThread(LPVOID) {
     while (!g_bUnloading.load()) {
         Sleep(3000);
-        if (!IsAgileMarkPresent()) { InitiateHardUnload(); return 0; }
-    }
-    return 0;
-}
-
-void LogLoadedModules() {
-    HMODULE hMods[1024]; DWORD cbNeeded;
-    if (EnumProcessModules(GetCurrentProcess(), hMods, sizeof(hMods), &cbNeeded)) {
-        for (int i = 0; i < (cbNeeded / sizeof(HMODULE)); i++) {
-            TCHAR szModName[MAX_PATH];
-            if (GetModuleBaseName(GetCurrentProcess(), hMods[i], szModName, sizeof(szModName) / sizeof(TCHAR))) {
-                std::wstring ws(szModName);
-                std::string s(ws.begin(), ws.end());
-                if (s.find("mf") != std::string::npos || s.find("d3d") != std::string::npos)
-                    DebugLog::log("[WebcamDLL] Module: " + s);
-            }
+        HANDLE h = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        PROCESSENTRY32W pe{sizeof(pe)};
+        bool found = false;
+        if (Process32FirstW(h, &pe)) {
+            do { if (_wcsicmp(pe.szExeFile, L"WebcamWatermark.exe") == 0) { found = true; break; } } while (Process32NextW(h, &pe));
+        }
+        CloseHandle(h);
+        if (!found) {
+            g_bUnloading = true;
+            MH_DisableHook(MH_ALL_HOOKS);
+            MH_Uninitialize();
+            FreeLibraryAndExitThread(g_hModule, 0);
         }
     }
+    return 0;
 }
 
 extern "C" __declspec(dllexport) DWORD WINAPI StartWatch(LPVOID lp) {
     if (g_bInitialized.exchange(true)) return 0;
     DebugLog::initialize();
-    DebugLog::log("[WebcamDLL] StartWatch v2.7.1");
-    LogLoadedModules();
+    DebugLog::log("[WebcamDLL] StartWatch v17.0.0 (Master AgileMark Style)");
 
     if (MH_Initialize() == MH_OK) {
-        HMODULE hMF = GetModuleHandleW(L"Mfreadwrite.dll");
-        if (!hMF) hMF = LoadLibraryW(L"Mfreadwrite.dll");
-        HMODULE hMFPlat = GetModuleHandleW(L"Mfplat.dll");
-        if (!hMFPlat) hMFPlat = LoadLibraryW(L"Mfplat.dll");
-        
-        if (hMF) {
-            void* p1 = (void*)GetProcAddress(hMF, "MFCreateSourceReaderFromMediaSource");
-            void* p2 = (void*)GetProcAddress(hMF, "MFCreateSourceReaderFromUnknown");
-            void* p3 = (void*)GetProcAddress(hMF, "MFCreateSourceReaderFromByteStream");
-            if (p1) MH_CreateHook(p1, &HookedMFCreateSourceReaderFromMediaSource, (LPVOID*)&g_origMFCreateSourceReaderMS);
-            if (p2) MH_CreateHook(p2, &HookedMFCreateSourceReaderFromUnknown, (LPVOID*)&g_origMFCreateSourceReaderUnk);
-            if (p3) MH_CreateHook(p3, &HookedMFCreateSourceReaderFromByteStream, (LPVOID*)&g_origMFCreateSourceReaderBS);
+        HMODULE hOle32 = GetModuleHandleW(L"ole32.dll");
+        if (hOle32) {
+            void* p = (void*)GetProcAddress(hOle32, "CoCreateInstance");
+            MH_CreateHook(p, &HookedCoCreateInstance, (LPVOID*)&g_origCoCreateInstance);
+            MH_EnableHook(p);
         }
-        if (hMFPlat) {
-            void* p4 = (void*)GetProcAddress(hMFPlat, "MFCreateDeviceSource");
-            if (p4) MH_CreateHook(p4, &HookedMFCreateDeviceSource, (LPVOID*)&g_origMFCreateDeviceSource);
-        }
-        MH_EnableHook(MH_ALL_HOOKS);
     }
     CreateThread(NULL, 0, WatchdogThread, NULL, 0, NULL);
     return 0;
