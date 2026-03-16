@@ -10,14 +10,25 @@
 #include <mferror.h>
 #include <tlhelp32.h>
 #include <psapi.h>
+#include <gdiplus.h>
 #include "DebugLog.h"
 #include "../packages/minhook.1.3.3/lib/native/include/MinHook.h"
+#include <nlohmann/json.hpp>
+#include "Renderer/RendererManager.h"
+#include "Renderer/RenderSnapshot.h"
+#include <vector>
+#include <memory>
+#include <shlwapi.h>
 
 #pragma comment(lib, "strmiids.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "mfplat.lib")
 #pragma comment(lib, "mfreadwrite.lib")
 #pragma comment(lib, "mfuuid.lib")
+#pragma comment(lib, "shlwapi.lib")
+#pragma comment(lib, "gdiplus.lib")
+
+using json = nlohmann::json;
 
 #ifdef _WIN64
     #pragma comment(lib, "../packages/minhook.1.3.3/lib/native/lib/libMinHook-x64-v141-mt.lib")
@@ -29,15 +40,120 @@
 static HINSTANCE g_hModule = NULL;
 static std::atomic<bool> g_bUnloading(false);
 static std::atomic<bool> g_bInitialized(false);
+static std::atomic<int> g_activeCalls(0); 
 static std::mutex g_hookMutex;
 static std::mutex g_drawMutex;
+static ULONG_PTR g_gdiplusToken = 0;
 
-// Flags to prevent multiple hooks causing crashes in Teams/Webex
 static std::atomic<bool> g_bDShowHooked(false);
 static std::atomic<bool> g_bMFHooked(false);
 static std::atomic<bool> g_bMFCallbackHooked(false);
 
-// --- AGILEMARK Standard Bitmap Font 8x8 ---
+static HANDLE g_hIpcThread = NULL;
+static const wchar_t* kPipeInject = L"\\\\.\\pipe\\AgileMarkPipe_qaKOab5VPyK4ar4A6sfm2VZ0";
+
+static Gdiplus::Bitmap* g_pWatermarkBmp = nullptr;
+static std::mutex g_bmpMutex;
+
+// --- UTF8 helpers & json getters ---
+static std::wstring Utf8ToUtf16(const std::string& s) {
+    if (s.empty()) return L"";
+    int len = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
+    std::wstring ws(len, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), &ws[0], len);
+    return ws;
+}
+static std::wstring jget_w(const json& j, const char* key, const std::wstring& def = L"") {
+    if (!j.contains(key) || !j[key].is_string()) return def;
+    return Utf8ToUtf16(j[key].get<std::string>());
+}
+static float jget_f(const json& j, const char* key, float def = 0.0f) {
+    if (!j.contains(key)) return def;
+    if (j[key].is_number_float()) return (float)j[key].get<double>();
+    if (j[key].is_number_integer()) return (float)j[key].get<long long>();
+    return def;
+}
+static int jget_i(const json& j, const char* key, int def = 0) {
+    if (!j.contains(key)) return def;
+    if (j[key].is_number_integer()) return (int)j[key].get<long long>();
+    if (j[key].is_number_float())  return (int)j[key].get<double>();
+    return def;
+}
+static bool jget_b(const json& j, const char* key, bool def = false) {
+    if (!j.contains(key) || !j[key].is_boolean()) return def;
+    return j[key].get<bool>();
+}
+
+static bool TryParseSnapshotFromJson(const json& j, RenderSnapshot& outSnap) {
+    if (!j.contains("MarkerJson") || !j["MarkerJson"].is_string()) return false;
+    try {
+        std::string mj_str = j["MarkerJson"].get<std::string>();
+        auto m = json::parse(mj_str);
+        outSnap.DrawingEnabled = jget_b(m, "DrawingEnabled", true);
+        outSnap.Opacity = jget_f(m, "Opacity", 1.0f);
+        {
+            std::wstring custom = jget_w(m, "TextCustomDateTimeFormat", L"");
+            std::wstring tsfmt = jget_w(m, "TimestampFormat", L"");
+            if (!custom.empty()) outSnap.TimestampFormat = custom;
+            else if (!tsfmt.empty()) outSnap.TimestampFormat = tsfmt;
+            else outSnap.TimestampFormat = L"HH:mm:ss dd/MM/yyyy";
+        }
+        outSnap.TextEnabled = jget_b(m, "TextEnabled", false);
+        outSnap.TextFormat = jget_w(m, "TextFormat", L"{machinename} | {shortdate} {shorttime}");
+        outSnap.TextSize = (float)jget_i(m, "TextSize", 28);
+        outSnap.TextOpacity = jget_f(m, "TextOpacity", 0.25f);
+        outSnap.TextBlurRadius = jget_f(m, "TextBlurRadius", 0.0f);
+        outSnap.TextAdjustment = jget_b(m, "TextAdjustment", false);
+        outSnap.TextSpacingEnabled = jget_b(m, "TextSpacingEnabled", true);
+        outSnap.TextSpacingX = (float)jget_i(m, "TextSpacingX", 320);
+        outSnap.TextSpacingY = (float)jget_i(m, "TextSpacingY", 160);
+        outSnap.TextCols = jget_i(m, "TextCols", 4);
+        outSnap.TextRows = jget_i(m, "TextRows", 3);
+        outSnap.TextColor1 = jget_w(m, "TextColor1", L"#000000");
+        outSnap.TextColor2 = jget_w(m, "TextColor2", L"#FFFFFF");
+        {
+            int ang = jget_i(m, "TextAngle", 0);
+            outSnap.TextAngleDeg = RenderSnapshot::NormalizeAngleDeg((float)ang);
+        }
+        return true;
+    } catch (...) { return false; }
+}
+
+static void ProcessPipeLineBuffer(std::string& buffer) {
+    while (true) {
+        size_t pos = buffer.find('\n');
+        if (pos == std::string::npos) break;
+        std::string line = buffer.substr(0, pos);
+        buffer.erase(0, pos + 1);
+        if (line.empty()) continue;
+        try {
+            auto j = json::parse(line);
+            RenderSnapshot snap;
+            if (TryParseSnapshotFromJson(j, snap)) {
+                RendererManager::Instance().SetSnapshot(snap);
+            }
+        } catch (...) {}
+    }
+}
+
+static DWORD WINAPI IpcClientThread(LPVOID) {
+    DebugLog::log("[WebcamDLL][IPC] Client thread started");
+    std::string buffer;
+    while (!g_bUnloading.load()) {
+        HANDLE hPipe = CreateFileW(kPipeInject, GENERIC_READ, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (hPipe == INVALID_HANDLE_VALUE) { Sleep(1000); continue; }
+        char tmp[2048]; DWORD cb = 0;
+        while (!g_bUnloading.load() && ReadFile(hPipe, tmp, sizeof(tmp), &cb, nullptr) && cb > 0) {
+            buffer.append(tmp, cb);
+            ProcessPipeLineBuffer(buffer);
+        }
+        CloseHandle(hPipe);
+    }
+    DebugLog::log("[WebcamDLL][IPC] Client thread exited");
+    return 0;
+}
+
+// --- Bitmap Font for Fallback ---
 static unsigned char g_agilemark_font[9][8] = {
     {0x18, 0x3C, 0x66, 0x66, 0x7E, 0x66, 0x66, 0x00}, // A
     {0x3C, 0x66, 0x60, 0x6E, 0x66, 0x66, 0x3C, 0x00}, // G
@@ -50,26 +166,20 @@ static unsigned char g_agilemark_font[9][8] = {
     {0x66, 0x6C, 0x78, 0x70, 0x78, 0x6C, 0x66, 0x00}  // K
 };
 
-// --- Drawing Engines ---
 void DrawAgileMarkYUY2(BYTE* pData, int width, int height, int base_x, int base_y, BYTE Y, BYTE U, BYTE V) {
     int stride = width * 2;
     for (int i = 0; i < 9; i++) {
-        int char_x = base_x + i * 14;
-        int char_y = base_y + i * 4;
+        int char_x = base_x + i * 14; int char_y = base_y + i * 4;
         for (int r = 0; r < 8; r++) {
             for (int c = 0; c < 8; c++) {
                 if (g_agilemark_font[i][r] & (0x80 >> c)) {
                     for (int dy = 0; dy < 2; dy++) {
                         for (int dx = 0; dx < 2; dx++) {
-                            int px = char_x + c * 2 + dx;
-                            int py = char_y + r * 2 + dy;
+                            int px = char_x + c * 2 + dx; int py = char_y + r * 2 + dy;
                             if (px >= 0 && px < width && py >= 0 && py < height) {
-                                int pos = py * stride + px * 2;
-                                pData[pos] = Y;
+                                int pos = py * stride + px * 2; pData[pos] = Y;
                                 int uv_pos = py * stride + (px & ~1) * 2 + 1;
-                                if (uv_pos + 2 < width * height * 2) {
-                                    pData[uv_pos] = U; pData[uv_pos + 2] = V;
-                                }
+                                if (uv_pos + 2 < width * height * 2) { pData[uv_pos] = U; pData[uv_pos + 2] = V; }
                             }
                         }
                     }
@@ -81,22 +191,17 @@ void DrawAgileMarkYUY2(BYTE* pData, int width, int height, int base_x, int base_
 
 void DrawAgileMarkNV12(BYTE* pY, BYTE* pUV, int width, int height, int stride, int base_x, int base_y, BYTE Y, BYTE U, BYTE V) {
     for (int i = 0; i < 9; i++) {
-        int char_x = base_x + i * 14;
-        int char_y = base_y + i * 4;
+        int char_x = base_x + i * 14; int char_y = base_y + i * 4;
         for (int r = 0; r < 8; r++) {
             for (int c = 0; c < 8; c++) {
                 if (g_agilemark_font[i][r] & (0x80 >> c)) {
                     for (int dy = 0; dy < 2; dy++) {
                         for (int dx = 0; dx < 2; dx++) {
-                            int px = char_x + c * 2 + dx;
-                            int py = char_y + r * 2 + dy;
+                            int px = char_x + c * 2 + dx; int py = char_y + r * 2 + dy;
                             if (px >= 0 && px < width && py >= 0 && py < height) {
                                 pY[py * stride + px] = Y;
-                                int uv_x = px & ~1;
-                                int uv_y = py / 2;
-                                int uv_pos = uv_y * stride + uv_x;
-                                pUV[uv_pos] = U;
-                                pUV[uv_pos + 1] = V;
+                                int uv_x = px & ~1; int uv_y = py / 2;
+                                int uv_pos = uv_y * stride + uv_x; pUV[uv_pos] = U; pUV[uv_pos + 1] = V;
                             }
                         }
                     }
@@ -106,172 +211,243 @@ void DrawAgileMarkNV12(BYTE* pY, BYTE* pUV, int width, int height, int stride, i
     }
 }
 
-void ProcessWatermark(BYTE* pData, int width, int height, bool isNV12, int stride = 0) {
-    std::lock_guard<std::mutex> lock(g_drawMutex);
-    BYTE Y = 76, U = 84, V = 255; // Red Color
-    int stepX = 250, stepY = 180;
-    if (stride == 0) stride = width;
+// --- Macro Expansion Helper ---
+static std::wstring ExpandMacros(std::wstring text) {
+    auto ReplaceAll = [&](const std::wstring& search, const std::wstring& replace) {
+        size_t pos = 0;
+        std::wstring searchLower = search; for (auto& c : searchLower) c = towlower(c);
+        while (true) {
+            std::wstring textLower = text; for (auto& c : textLower) c = towlower(c);
+            pos = textLower.find(searchLower, pos);
+            if (pos == std::wstring::npos) break;
+            text.replace(pos, search.length(), replace);
+            pos += replace.length();
+        }
+    };
+    wchar_t comp[MAX_COMPUTERNAME_LENGTH + 1]; DWORD sz = ARRAYSIZE(comp);
+    if (GetComputerNameW(comp, &sz)) ReplaceAll(L"{MachineName}", comp);
+    wchar_t user[256]; DWORD usz = ARRAYSIZE(user);
+    if (GetUserNameW(user, &usz)) ReplaceAll(L"{UserName}", user);
+    SYSTEMTIME st; GetLocalTime(&st); wchar_t buf[64];
+    swprintf_s(buf, L"%02d/%02d/%04d", st.wDay, st.wMonth, st.wYear); ReplaceAll(L"{ShortDate}", buf);
+    swprintf_s(buf, L"%02d:%02d:%02d", st.wHour, st.wMinute, st.wSecond); ReplaceAll(L"{ShortTime}", buf);
+    return text;
+}
 
-    for (int y = -100; y < height; y += stepY) {
-        for (int x = -100; x < width; x += stepX) {
-            if (isNV12) {
-                BYTE* pUV = pData + stride * height;
-                DrawAgileMarkNV12(pData, pUV, width, height, stride, x, y, Y, U, V);
-            } else {
-                DrawAgileMarkYUY2(pData, width, height, x, y, Y, U, V);
-            }
+// --- GDI+ Drawing Core ---
+void UpdateWatermarkBitmap(const RenderSnapshot& snap, int width, int height) {
+    std::lock_guard<std::mutex> lock(g_bmpMutex);
+    if (g_pWatermarkBmp) { delete g_pWatermarkBmp; g_pWatermarkBmp = nullptr; }
+    if (!snap.DrawingEnabled || !snap.TextEnabled || g_bUnloading.load()) return;
+
+    g_pWatermarkBmp = new Gdiplus::Bitmap(width, height, PixelFormat32bppARGB);
+    Gdiplus::Graphics g(g_pWatermarkBmp);
+    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAlias);
+    g.Clear(Gdiplus::Color(0, 0, 0, 0));
+
+    std::wstring text = ExpandMacros(snap.TextFormat);
+    Gdiplus::FontFamily ff(L"Arial");
+    Gdiplus::Font font(&ff, snap.TextSize, Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
+    
+    int r = 255, gc = 255, b = 255;
+    if (snap.TextColor1.size() == 7 && snap.TextColor1[0] == '#') swscanf_s(snap.TextColor1.c_str(), L"#%02x%02x%02x", &r, &gc, &b);
+    Gdiplus::SolidBrush brush(Gdiplus::Color((BYTE)(snap.TextOpacity * 255), (BYTE)r, (BYTE)gc, (BYTE)b));
+
+    int sx = (int)snap.TextSpacingX; int sy = (int)snap.TextSpacingY;
+    if (sx < 50) sx = 300; if (sy < 50) sy = 200;
+
+    for (int y = 0; y < height; y += sy) {
+        for (int x = 0; x < width; x += sx) {
+            g.ResetTransform(); g.TranslateTransform((float)x, (float)y); g.RotateTransform(snap.TextAngleDeg);
+            g.DrawString(text.c_str(), -1, &font, Gdiplus::PointF(0, 0), &brush);
         }
     }
 }
 
-// --- Media Foundation Hooks ---
+void BlendARGBtoYUY2(BYTE* pData, int width, int height, Gdiplus::Bitmap* pBmp) {
+    if (!pBmp || g_bUnloading.load()) return;
+    Gdiplus::BitmapData bd; Gdiplus::Rect rc(0, 0, width, height);
+    if (pBmp->LockBits(&rc, Gdiplus::ImageLockModeRead, PixelFormat32bppARGB, &bd) == Gdiplus::Ok) {
+        BYTE* pSrc = (BYTE*)bd.Scan0; int st = width * 2;
+        for (int y = 0; y < height; y++) {
+            if (g_bUnloading.load()) break;
+            for (int x = 0; x < width; x++) {
+                BYTE* pPx = pSrc + (y * bd.Stride) + (x * 4); BYTE a = pPx[3];
+                if (a > 0) {
+                    int r = pPx[2], g = pPx[1], b = pPx[0];
+                    BYTE Y = (BYTE)((0.299 * r) + (0.587 * g) + (0.114 * b));
+                    BYTE U = (BYTE)(-(0.1687 * r) - (0.3313 * g) + (0.5 * b) + 128);
+                    BYTE V = (BYTE)((0.5 * r) - (0.4187 * g) - (0.0813 * b) + 128);
+                    int pos = y * st + x * 2;
+                    if (a == 255) { pData[pos] = Y; if (x % 2 == 0) { pData[pos+1] = U; pData[pos+3] = V; } }
+                    else { float f = a / 255.0f; pData[pos] = (BYTE)(pData[pos] * (1 - f) + Y * f); }
+                }
+            }
+        }
+        pBmp->UnlockBits(&bd);
+    }
+}
+
+void BlendARGBtoNV12(BYTE* pY, BYTE* pUV, int width, int height, int stride, Gdiplus::Bitmap* pBmp) {
+    if (!pBmp || g_bUnloading.load()) return;
+    Gdiplus::BitmapData bd; Gdiplus::Rect rc(0, 0, width, height);
+    if (pBmp->LockBits(&rc, Gdiplus::ImageLockModeRead, PixelFormat32bppARGB, &bd) == Gdiplus::Ok) {
+        BYTE* pSrc = (BYTE*)bd.Scan0;
+        for (int y = 0; y < height; y++) {
+            if (g_bUnloading.load()) break;
+            for (int x = 0; x < width; x++) {
+                BYTE* pPx = pSrc + (y * bd.Stride) + (x * 4); BYTE a = pPx[3];
+                if (a > 0) {
+                    int r = pPx[2], g = pPx[1], b = pPx[0];
+                    BYTE Y = (BYTE)((0.299 * r) + (0.587 * g) + (0.114 * b));
+                    BYTE U = (BYTE)(-(0.1687 * r) - (0.3313 * g) + (0.5 * b) + 128);
+                    BYTE V = (BYTE)((0.5 * r) - (0.4187 * g) - (0.0813 * b) + 128);
+                    if (a == 255) { pY[y * stride + x] = Y; if (x % 2 == 0 && y % 2 == 0) { int up = (y / 2) * stride + x; pUV[up] = U; pUV[up+1] = V; } }
+                    else { float f = a / 255.0f; pY[y * stride + x] = (BYTE)(pY[y * stride + x] * (1 - f) + Y * f); }
+                }
+            }
+        }
+        pBmp->UnlockBits(&bd);
+    }
+}
+
+// Actual drawing logic with C++ objects
+static void ProcessWatermarkInternal(BYTE* pData, int width, int height, bool isNV12, int stride) {
+    if (g_bUnloading.load()) return;
+    std::lock_guard<std::mutex> lock(g_drawMutex);
+    if (stride == 0) stride = width;
+    if (RendererManager::Instance().HasSnapshot()) {
+        const auto& snap = RendererManager::Instance().GetSnapshot();
+        static uint32_t lastSig = 0; uint32_t sig = (uint32_t)snap.Signature();
+        if (sig != lastSig || !g_pWatermarkBmp) { UpdateWatermarkBitmap(snap, width, height); lastSig = sig; }
+        if (g_pWatermarkBmp) {
+            std::lock_guard<std::mutex> bmpLock(g_bmpMutex);
+            if (isNV12) BlendARGBtoNV12(pData, pData + stride * height, width, height, stride, g_pWatermarkBmp);
+            else BlendARGBtoYUY2(pData, width, height, g_pWatermarkBmp);
+            return;
+        }
+    }
+    BYTE Y = 76, U = 84, V = 255; int sx = 250, sy = 180;
+    for (int y = -100; y < height; y += sy) {
+        for (int x = -100; x < width; x += sx) {
+            if (isNV12) DrawAgileMarkNV12(pData, pData + stride * height, width, height, stride, x, y, Y, U, V);
+            else DrawAgileMarkYUY2(pData, width, height, x, y, Y, U, V);
+        }
+    }
+}
+
+// Strictly follow SEH rules
+#pragma runtime_checks("", off)
+static void SafeDrawWrapper(BYTE* pData, int width, int height, bool isNV12, int stride) {
+    __try {
+        ProcessWatermarkInternal(pData, width, height, isNV12, stride);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+#pragma runtime_checks("", restore)
+
+void ProcessWatermark(BYTE* pData, int width, int height, bool isNV12, int stride = 0) {
+    if (g_bUnloading.load() || !pData) return;
+    g_activeCalls++;
+    SafeDrawWrapper(pData, width, height, isNV12, stride);
+    g_activeCalls--;
+}
+
+// --- Hooks ---
 typedef HRESULT(WINAPI* PMFCreateSourceReaderFromMediaSource)(IMFMediaSource*, IMFAttributes*, IMFSourceReader**);
 static PMFCreateSourceReaderFromMediaSource g_origMFCreateSourceReaderMS = NULL;
-
 typedef HRESULT(WINAPI* PMFCreateSourceReaderFromUnknown)(IUnknown*, IMFAttributes*, IMFSourceReader**);
 static PMFCreateSourceReaderFromUnknown g_origMFCreateSourceReaderUnk = NULL;
-
 typedef HRESULT(WINAPI* PMFCreateSourceReaderFromByteStream)(IMFByteStream*, IMFAttributes*, IMFSourceReader**);
 static PMFCreateSourceReaderFromByteStream g_origMFCreateSourceReaderBS = NULL;
-
 typedef HRESULT(STDMETHODCALLTYPE* POnReadSample)(IMFSourceReaderCallback*, HRESULT, DWORD, DWORD, LONGLONG, IMFSample*);
 static POnReadSample g_origOnReadSample = NULL;
-
 typedef HRESULT(STDMETHODCALLTYPE* PReadSample)(IMFSourceReader*, DWORD, DWORD, DWORD*, DWORD*, LONGLONG*, IMFSample**);
 static PReadSample g_origReadSample = NULL;
 
-void ProcessMFSample(IMFSample* pSample) {
-    if (!pSample || g_bUnloading.load()) return;
-    IMFMediaBuffer* pBuffer = NULL;
-    if (SUCCEEDED(pSample->ConvertToContiguousBuffer(&pBuffer))) {
-        BYTE* pData = NULL; LONG lStride = 0; DWORD cbCurrent = 0;
-        IMF2DBuffer* p2DBuffer = NULL;
-        if (SUCCEEDED(pBuffer->QueryInterface(IID_IMF2DBuffer, (void**)&p2DBuffer))) {
-            if (SUCCEEDED(p2DBuffer->Lock2D(&pData, &lStride))) {
-                // Determine height from stride/buffer size if possible, otherwise assume 480
-                int h = 480;
-                ProcessWatermark(pData, (int)abs(lStride), h, true, (int)abs(lStride));
-                p2DBuffer->Unlock2D();
-            }
-            p2DBuffer->Release();
-        } else if (SUCCEEDED(pBuffer->Lock(&pData, NULL, &cbCurrent))) {
-            ProcessWatermark(pData, 640, 480, false);
-            pBuffer->Unlock();
-        }
-        pBuffer->Release();
+void ProcessMFSample(IMFSample* pS) {
+    if (!pS || g_bUnloading.load()) return;
+    IMFMediaBuffer* pB = NULL;
+    if (SUCCEEDED(pS->ConvertToContiguousBuffer(&pB))) {
+        BYTE* pD = NULL; LONG st = 0; IMF2DBuffer* p2B = NULL;
+        if (SUCCEEDED(pB->QueryInterface(IID_IMF2DBuffer, (void**)&p2B))) {
+            if (SUCCEEDED(p2B->Lock2D(&pD, &st))) { ProcessWatermark(pD, (int)abs(st), 480, true, (int)abs(st)); p2B->Unlock2D(); }
+            p2B->Release();
+        } else if (SUCCEEDED(pB->Lock(&pD, NULL, NULL))) { ProcessWatermark(pD, 640, 480, false); pB->Unlock(); }
+        pB->Release();
     }
 }
 
-HRESULT STDMETHODCALLTYPE HookedOnReadSample(IMFSourceReaderCallback* pSelf, HRESULT hrStatus, DWORD dwStreamIndex, DWORD dwStreamFlags, LONGLONG llTimestamp, IMFSample* pSample) {
-    if (SUCCEEDED(hrStatus) && pSample) ProcessMFSample(pSample);
-    return g_origOnReadSample(pSelf, hrStatus, dwStreamIndex, dwStreamFlags, llTimestamp, pSample);
+HRESULT STDMETHODCALLTYPE HookedOnReadSample(IMFSourceReaderCallback* pS, HRESULT hr, DWORD di, DWORD df, LONGLONG ts, IMFSample* sa) {
+    if (SUCCEEDED(hr) && sa) ProcessMFSample(sa); return g_origOnReadSample(pS, hr, di, df, ts, sa);
+}
+HRESULT STDMETHODCALLTYPE HookedReadSample(IMFSourceReader* pS, DWORD di, DWORD df, DWORD* ad, DWORD* sf, LONGLONG* ts, IMFSample** sa) {
+    HRESULT hr = g_origReadSample(pS, di, df, ad, sf, ts, sa); if (SUCCEEDED(hr) && sa && *sa) ProcessMFSample(*sa); return hr;
 }
 
-HRESULT STDMETHODCALLTYPE HookedReadSample(IMFSourceReader* pSelf, DWORD dwStreamIndex, DWORD dwControlFlags, DWORD* pdwActualStreamIndex, DWORD* pdwStreamFlags, LONGLONG* pllTimestamp, IMFSample** ppSample) {
-    HRESULT hr = g_origReadSample(pSelf, dwStreamIndex, dwControlFlags, pdwActualStreamIndex, pdwStreamFlags, pllTimestamp, ppSample);
-    if (SUCCEEDED(hr) && ppSample && *ppSample) ProcessMFSample(*ppSample);
-    return hr;
-}
-
-void HookSourceReader(IMFSourceReader* pReader, IMFAttributes* pAttributes) {
-    if (!pReader) return;
-    std::lock_guard<std::mutex> lock(g_hookMutex);
-    
+void HookSourceReader(IMFSourceReader* pR, IMFAttributes* pA) {
+    if (!pR) return; std::lock_guard<std::mutex> lk(g_hookMutex);
     if (!g_bMFHooked.load()) {
-        void** vtable = *(void***)pReader;
-        if (MH_CreateHook(vtable[9], &HookedReadSample, (LPVOID*)&g_origReadSample) == MH_OK) {
-            MH_EnableHook(vtable[9]);
-            g_bMFHooked = true;
-            DebugLog::log("[WebcamDLL] Hooked IMFSourceReader::ReadSample");
-        }
+        void** vt = *(void***)pR; if (MH_CreateHook(vt[9], &HookedReadSample, (LPVOID*)&g_origReadSample) == MH_OK) { MH_EnableHook(vt[9]); g_bMFHooked = true; }
     }
-
-    if (pAttributes && !g_bMFCallbackHooked.load()) {
-        IUnknown* pUnkCallback = NULL;
-        if (SUCCEEDED(pAttributes->GetUnknown(MF_SOURCE_READER_ASYNC_CALLBACK, IID_IUnknown, (LPVOID*)&pUnkCallback))) {
-            void** cbVtable = *(void***)pUnkCallback;
-            if (MH_CreateHook(cbVtable[3], &HookedOnReadSample, (LPVOID*)&g_origOnReadSample) == MH_OK) {
-                MH_EnableHook(cbVtable[3]);
-                g_bMFCallbackHooked = true;
-                DebugLog::log("[WebcamDLL] Hooked IMFSourceReaderCallback::OnReadSample");
-            }
-            pUnkCallback->Release();
+    if (pA && !g_bMFCallbackHooked.load()) {
+        IUnknown* pC = NULL; if (SUCCEEDED(pA->GetUnknown(MF_SOURCE_READER_ASYNC_CALLBACK, IID_IUnknown, (LPVOID*)&pC))) {
+            void** vt = *(void***)pC; if (MH_CreateHook(vt[3], &HookedOnReadSample, (LPVOID*)&g_origOnReadSample) == MH_OK) { MH_EnableHook(vt[3]); g_bMFCallbackHooked = true; }
+            pC->Release();
         }
     }
 }
 
-HRESULT WINAPI HookedMFCreateSourceReaderFromMediaSource(IMFMediaSource* pMS, IMFAttributes* pAttr, IMFSourceReader** ppSR) {
-    HRESULT hr = g_origMFCreateSourceReaderMS(pMS, pAttr, ppSR);
-    if (SUCCEEDED(hr) && ppSR && *ppSR) HookSourceReader(*ppSR, pAttr);
-    return hr;
+HRESULT WINAPI HookedMFCreateSourceReaderFromMediaSource(IMFMediaSource* pM, IMFAttributes* pA, IMFSourceReader** pS) {
+    HRESULT hr = g_origMFCreateSourceReaderMS(pM, pA, pS); if (SUCCEEDED(hr) && pS && *pS) HookSourceReader(*pS, pA); return hr;
 }
-
-HRESULT WINAPI HookedMFCreateSourceReaderFromUnknown(IUnknown* pUnk, IMFAttributes* pAttr, IMFSourceReader** ppSR) {
-    HRESULT hr = g_origMFCreateSourceReaderUnk(pUnk, pAttr, ppSR);
-    if (SUCCEEDED(hr) && ppSR && *ppSR) HookSourceReader(*ppSR, pAttr);
-    return hr;
+HRESULT WINAPI HookedMFCreateSourceReaderFromUnknown(IUnknown* pU, IMFAttributes* pA, IMFSourceReader** pS) {
+    HRESULT hr = g_origMFCreateSourceReaderUnk(pU, pA, pS); if (SUCCEEDED(hr) && pS && *pS) HookSourceReader(*pS, pA); return hr;
 }
-
-HRESULT WINAPI HookedMFCreateSourceReaderFromByteStream(IMFByteStream* pBS, IMFAttributes* pAttr, IMFSourceReader** ppSR) {
-    HRESULT hr = g_origMFCreateSourceReaderBS(pBS, pAttr, ppSR);
-    if (SUCCEEDED(hr) && ppSR && *ppSR) HookSourceReader(*ppSR, pAttr);
-    return hr;
+HRESULT WINAPI HookedMFCreateSourceReaderFromByteStream(IMFByteStream* pB, IMFAttributes* pA, IMFSourceReader** pS) {
+    HRESULT hr = g_origMFCreateSourceReaderBS(pB, pA, pS); if (SUCCEEDED(hr) && pS && *pS) HookSourceReader(*pS, pA); return hr;
 }
 
 // --- DirectShow Hooks ---
 typedef HRESULT(WINAPI* PCoCreateInstance)(REFCLSID, LPUNKNOWN, DWORD, REFIID, LPVOID*);
 static PCoCreateInstance g_origCoCreateInstance = NULL;
-
 typedef HRESULT(STDMETHODCALLTYPE* PGraphConnect)(IGraphBuilder*, IPin*, IPin*);
 static PGraphConnect g_origGraphConnect = NULL;
-
 typedef HRESULT(STDMETHODCALLTYPE* PReceive)(IMemInputPin*, IMediaSample*);
 static PReceive g_origReceive = NULL;
 
-HRESULT STDMETHODCALLTYPE HookedReceive(IMemInputPin* pSelf, IMediaSample* pSample) {
-    if (pSample && !g_bUnloading.load()) {
-        BYTE* pBuffer = NULL;
-        if (SUCCEEDED(pSample->GetPointer(&pBuffer))) {
-            long actualLen = pSample->GetActualDataLength();
-            int w = 640, h = 480;
-            if (actualLen >= 1280 * 720 * 2) { w = 1280; h = 720; }
-            ProcessWatermark(pBuffer, w, h, false);
+HRESULT STDMETHODCALLTYPE HookedReceive(IMemInputPin* pS, IMediaSample* pM) {
+    if (pM && !g_bUnloading.load()) {
+        BYTE* pB = NULL; if (SUCCEEDED(pM->GetPointer(&pB))) {
+            long len = pM->GetActualDataLength(); int w = 640, h = 480; if (len >= 1280 * 720 * 2) { w = 1280; h = 720; }
+            ProcessWatermark(pB, w, h, false);
         }
     }
-    return g_origReceive(pSelf, pSample);
+    return g_origReceive(pS, pM);
 }
 
-HRESULT STDMETHODCALLTYPE HookedGraphConnect(IGraphBuilder* pSelf, IPin* pOut, IPin* pIn) {
-    HRESULT hr = g_origGraphConnect(pSelf, pOut, pIn);
+HRESULT STDMETHODCALLTYPE HookedGraphConnect(IGraphBuilder* pS, IPin* pO, IPin* pI) {
+    HRESULT hr = g_origGraphConnect(pS, pO, pI);
     if (SUCCEEDED(hr)) {
-        IMemInputPin* pMemInput = NULL;
-        if (SUCCEEDED(pIn->QueryInterface(IID_IMemInputPin, (void**)&pMemInput))) {
-            std::lock_guard<std::mutex> lock(g_hookMutex);
+        IMemInputPin* pM = NULL; if (SUCCEEDED(pI->QueryInterface(IID_IMemInputPin, (void**)&pM))) {
+            std::lock_guard<std::mutex> lk(g_hookMutex);
             if (!g_bDShowHooked.load()) {
-                void** vtable = *(void***)pMemInput;
-                if (MH_CreateHook(vtable[6], &HookedReceive, (LPVOID*)&g_origReceive) == MH_OK) {
-                    MH_EnableHook(vtable[6]);
-                    g_bDShowHooked = true;
-                    DebugLog::log("[WebcamDLL] Hooked IMemInputPin::Receive");
-                }
+                void** vt = *(void***)pM; if (MH_CreateHook(vt[6], &HookedReceive, (LPVOID*)&g_origReceive) == MH_OK) { MH_EnableHook(vt[6]); g_bDShowHooked = true; }
             }
-            pMemInput->Release();
+            pM->Release();
         }
     }
     return hr;
 }
 
-HRESULT WINAPI HookedCoCreateInstance(REFCLSID rclsid, LPUNKNOWN pUnkOuter, DWORD dwClsContext, REFIID riid, LPVOID* ppv) {
-    HRESULT hr = g_origCoCreateInstance(rclsid, pUnkOuter, dwClsContext, riid, ppv);
+HRESULT WINAPI HookedCoCreateInstance(REFCLSID clsid, LPUNKNOWN pU, DWORD ctx, REFIID riid, LPVOID* ppv) {
+    HRESULT hr = g_origCoCreateInstance(clsid, pU, ctx, riid, ppv);
     if (SUCCEEDED(hr) && ppv && *ppv) {
         if (riid == IID_IGraphBuilder || riid == IID_IFilterGraph) {
-            std::lock_guard<std::mutex> lock(g_hookMutex);
-            void** vtable = *(void***)*ppv;
-            // We can hook multiple graph builders, but they usually share the same vtable
-            if (MH_CreateHook(vtable[11], &HookedGraphConnect, (LPVOID*)&g_origGraphConnect) == MH_OK) {
-                MH_EnableHook(vtable[11]);
-                DebugLog::log("[WebcamDLL] Hooked IGraphBuilder::Connect");
-            }
+            std::lock_guard<std::mutex> lk(g_hookMutex);
+            static void* lastVT = nullptr; void** vt = *(void***)*ppv;
+            if (vt != lastVT) { if (MH_CreateHook(vt[11], &HookedGraphConnect, (LPVOID*)&g_origGraphConnect) == MH_OK) { MH_EnableHook(vt[11]); lastVT = vt; } }
         }
     }
     return hr;
@@ -280,20 +456,28 @@ HRESULT WINAPI HookedCoCreateInstance(REFCLSID rclsid, LPUNKNOWN pUnkOuter, DWOR
 // --- Watchdog ---
 DWORD WINAPI WatchdogThread(LPVOID) {
     while (!g_bUnloading.load()) {
-        Sleep(3000);
+        Sleep(3000); 
         HANDLE h = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        PROCESSENTRY32W pe{sizeof(pe)};
-        bool found = false;
-        if (Process32FirstW(h, &pe)) {
-            do {
-                if (_wcsicmp(pe.szExeFile, L"WebcamWatermark.exe") == 0) { found = true; break; }
-            } while (Process32NextW(h, &pe));
-        }
+        PROCESSENTRY32W pe{sizeof(pe)}; bool found = false;
+        if (Process32FirstW(h, &pe)) { do { if (_wcsicmp(pe.szExeFile, L"AgileMark.exe") == 0) { found = true; break; } } while (Process32NextW(h, &pe)); }
         CloseHandle(h);
         if (!found) {
+            DebugLog::log("[WebcamDLL] AgileMark not found. Entering Zombie Mode...");
             g_bUnloading = true;
+            
+            // Step 1: Wait for any active drawing calls to drain
+            while (g_activeCalls.load() > 0) Sleep(50);
+            
+            // Step 2: Disable all hooks immediately to return Zoom to normal
             MH_DisableHook(MH_ALL_HOOKS);
-            MH_Uninitialize();
+            
+            // Step 3: Wait a VERY LONG time (3 seconds) to ensure all Zoom threads 
+            // that were inside our code have returned to Zoom's own memory.
+            Sleep(3000);
+            
+            DebugLog::log("[WebcamDLL] Safe to terminate. Goodbye.");
+            // We exit the thread, but we don't necessarily need to FreeLibrary if it's too risky.
+            // However, FreeLibraryAndExitThread is standard if we've waited long enough.
             FreeLibraryAndExitThread(g_hModule, 0);
         }
     }
@@ -302,29 +486,20 @@ DWORD WINAPI WatchdogThread(LPVOID) {
 
 extern "C" __declspec(dllexport) DWORD WINAPI StartWatch(LPVOID lp) {
     if (g_bInitialized.exchange(true)) return 0;
-    DebugLog::initialize();
-    DebugLog::log("[WebcamDLL] StartWatch v18.1.0 (Safe Unified)");
-
+    DebugLog::initialize(); DebugLog::log("[WebcamDLL] StartWatch v18.3.0 (Zombie Protection)");
+    Gdiplus::GdiplusStartupInput gsi; Gdiplus::GdiplusStartup(&g_gdiplusToken, &gsi, NULL);
+    g_hIpcThread = CreateThread(NULL, 0, IpcClientThread, NULL, 0, NULL);
     if (MH_Initialize() == MH_OK) {
-        // DirectShow Hook
-        HMODULE hOle32 = GetModuleHandleW(L"ole32.dll");
-        if (hOle32) {
-            void* p = (void*)GetProcAddress(hOle32, "CoCreateInstance");
-            MH_CreateHook(p, &HookedCoCreateInstance, (LPVOID*)&g_origCoCreateInstance);
-        }
-
-        // Media Foundation Hooks
-        HMODULE hMF = GetModuleHandleW(L"Mfreadwrite.dll");
-        if (!hMF) hMF = LoadLibraryW(L"Mfreadwrite.dll");
-        if (hMF) {
-            void* p1 = (void*)GetProcAddress(hMF, "MFCreateSourceReaderFromMediaSource");
-            void* p2 = (void*)GetProcAddress(hMF, "MFCreateSourceReaderFromUnknown");
-            void* p3 = (void*)GetProcAddress(hMF, "MFCreateSourceReaderFromByteStream");
+        HMODULE hO = GetModuleHandleW(L"ole32.dll"); if (hO) MH_CreateHook((void*)GetProcAddress(hO, "CoCreateInstance"), &HookedCoCreateInstance, (LPVOID*)&g_origCoCreateInstance);
+        HMODULE hM = GetModuleHandleW(L"Mfreadwrite.dll"); if (!hM) hM = LoadLibraryW(L"Mfreadwrite.dll");
+        if (hM) {
+            void* p1 = (void*)GetProcAddress(hM, "MFCreateSourceReaderFromMediaSource");
+            void* p2 = (void*)GetProcAddress(hM, "MFCreateSourceReaderFromUnknown");
+            void* p3 = (void*)GetProcAddress(hM, "MFCreateSourceReaderFromByteStream");
             if (p1) MH_CreateHook(p1, &HookedMFCreateSourceReaderFromMediaSource, (LPVOID*)&g_origMFCreateSourceReaderMS);
             if (p2) MH_CreateHook(p2, &HookedMFCreateSourceReaderFromUnknown, (LPVOID*)&g_origMFCreateSourceReaderUnk);
             if (p3) MH_CreateHook(p3, &HookedMFCreateSourceReaderFromByteStream, (LPVOID*)&g_origMFCreateSourceReaderBS);
         }
-
         MH_EnableHook(MH_ALL_HOOKS);
     }
     CreateThread(NULL, 0, WatchdogThread, NULL, 0, NULL);
