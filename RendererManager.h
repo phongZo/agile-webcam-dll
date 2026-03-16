@@ -22,6 +22,9 @@ public:
 
 	boolean SetSnapshot(const RenderSnapshot& snap);
 
+	bool HasSnapshot() const { return m_hasSnapshot; }
+	const RenderSnapshot& GetSnapshot() const { return m_snapshot; }
+
 	void DrawOverlay(ID2D1RenderTarget* rt, const SIZE& size);
 
 private:
