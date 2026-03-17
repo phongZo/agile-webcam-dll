@@ -3,6 +3,7 @@
 #include <string>
 #include <atomic>
 #include <mutex>
+#include <map>
 #include <dshow.h>
 #include <mfapi.h>
 #include <mfidl.h>
@@ -28,6 +29,24 @@
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "gdiplus.lib")
 
+// Helper to free AM_MEDIA_TYPE
+void FreeMediaType(AM_MEDIA_TYPE& mt) {
+    if (mt.cbFormat != 0) {
+        CoTaskMemFree((PVOID)mt.pbFormat);
+        mt.cbFormat = 0;
+        mt.pbFormat = NULL;
+    }
+    if (mt.pUnk != NULL) {
+        mt.pUnk->Release();
+        mt.pUnk = NULL;
+    }
+}
+
+// Ensure NV12 subtype is defined if not already
+#ifndef MEDIASUBTYPE_NV12
+DEFINE_GUID(MEDIASUBTYPE_NV12, 0x3231564e, 0x0000, 0x0010, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71);
+#endif
+
 using json = nlohmann::json;
 
 #ifdef _WIN64
@@ -48,6 +67,16 @@ static ULONG_PTR g_gdiplusToken = 0;
 static std::atomic<bool> g_bDShowHooked(false);
 static std::atomic<bool> g_bMFHooked(false);
 static std::atomic<bool> g_bMFCallbackHooked(false);
+static bool g_isMirrorMode = false;
+
+struct VideoConfig {
+    int width = 0;
+    int height = 0;
+    int stride = 0;
+    bool isNV12 = false;
+};
+static std::mutex g_cfgMutex;
+static std::map<void*, VideoConfig> g_videoConfigs;
 
 static HANDLE g_hIpcThread = NULL;
 static const wchar_t* kPipeInject = L"\\\\.\\pipe\\AgileMarkPipe_qaKOab5VPyK4ar4A6sfm2VZ0";
@@ -153,64 +182,6 @@ static DWORD WINAPI IpcClientThread(LPVOID) {
     return 0;
 }
 
-// --- Bitmap Font for Fallback ---
-static unsigned char g_agilemark_font[9][8] = {
-    {0x18, 0x3C, 0x66, 0x66, 0x7E, 0x66, 0x66, 0x00}, // A
-    {0x3C, 0x66, 0x60, 0x6E, 0x66, 0x66, 0x3C, 0x00}, // G
-    {0x3C, 0x18, 0x18, 0x18, 0x18, 0x18, 0x3C, 0x00}, // I
-    {0x60, 0x60, 0x60, 0x60, 0x60, 0x60, 0x7E, 0x00}, // L
-    {0x7E, 0x60, 0x60, 0x78, 0x60, 0x60, 0x7E, 0x00}, // E
-    {0x66, 0x7E, 0x7E, 0x66, 0x66, 0x66, 0x66, 0x00}, // M
-    {0x18, 0x3C, 0x66, 0x66, 0x7E, 0x66, 0x66, 0x00}, // A
-    {0x7C, 0x66, 0x66, 0x7C, 0x78, 0x66, 0x66, 0x00}, // R
-    {0x66, 0x6C, 0x78, 0x70, 0x78, 0x6C, 0x66, 0x00}  // K
-};
-
-void DrawAgileMarkYUY2(BYTE* pData, int width, int height, int base_x, int base_y, BYTE Y, BYTE U, BYTE V) {
-    int stride = width * 2;
-    for (int i = 0; i < 9; i++) {
-        int char_x = base_x + i * 14; int char_y = base_y + i * 4;
-        for (int r = 0; r < 8; r++) {
-            for (int c = 0; c < 8; c++) {
-                if (g_agilemark_font[i][r] & (0x80 >> c)) {
-                    for (int dy = 0; dy < 2; dy++) {
-                        for (int dx = 0; dx < 2; dx++) {
-                            int px = char_x + c * 2 + dx; int py = char_y + r * 2 + dy;
-                            if (px >= 0 && px < width && py >= 0 && py < height) {
-                                int pos = py * stride + px * 2; pData[pos] = Y;
-                                int uv_pos = py * stride + (px & ~1) * 2 + 1;
-                                if (uv_pos + 2 < width * height * 2) { pData[uv_pos] = U; pData[uv_pos + 2] = V; }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-void DrawAgileMarkNV12(BYTE* pY, BYTE* pUV, int width, int height, int stride, int base_x, int base_y, BYTE Y, BYTE U, BYTE V) {
-    for (int i = 0; i < 9; i++) {
-        int char_x = base_x + i * 14; int char_y = base_y + i * 4;
-        for (int r = 0; r < 8; r++) {
-            for (int c = 0; c < 8; c++) {
-                if (g_agilemark_font[i][r] & (0x80 >> c)) {
-                    for (int dy = 0; dy < 2; dy++) {
-                        for (int dx = 0; dx < 2; dx++) {
-                            int px = char_x + c * 2 + dx; int py = char_y + r * 2 + dy;
-                            if (px >= 0 && px < width && py >= 0 && py < height) {
-                                pY[py * stride + px] = Y;
-                                int uv_x = px & ~1; int uv_y = py / 2;
-                                int uv_pos = uv_y * stride + uv_x; pUV[uv_pos] = U; pUV[uv_pos + 1] = V;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
 // --- Macro Expansion Helper ---
 static std::wstring ExpandMacros(std::wstring text) {
     auto ReplaceAll = [&](const std::wstring& search, const std::wstring& replace) {
@@ -259,17 +230,23 @@ void UpdateWatermarkBitmap(const RenderSnapshot& snap, int width, int height) {
 
     for (int y = 0; y < height; y += sy) {
         for (int x = 0; x < width; x += sx) {
-            g.ResetTransform(); g.TranslateTransform((float)x, (float)y); g.RotateTransform(snap.TextAngleDeg);
+            g.ResetTransform(); 
+            if (g_isMirrorMode) {
+                g.ScaleTransform(-1.0f, 1.0f);
+                g.TranslateTransform(-(float)width, 0.0f);
+            }
+            g.TranslateTransform((float)x, (float)y); g.RotateTransform(snap.TextAngleDeg);
             g.DrawString(text.c_str(), -1, &font, Gdiplus::PointF(0, 0), &brush);
         }
     }
 }
 
-void BlendARGBtoYUY2(BYTE* pData, int width, int height, Gdiplus::Bitmap* pBmp) {
+void BlendARGBtoYUY2(BYTE* pData, int width, int height, int stride, Gdiplus::Bitmap* pBmp) {
     if (!pBmp || g_bUnloading.load()) return;
     Gdiplus::BitmapData bd; Gdiplus::Rect rc(0, 0, width, height);
     if (pBmp->LockBits(&rc, Gdiplus::ImageLockModeRead, PixelFormat32bppARGB, &bd) == Gdiplus::Ok) {
-        BYTE* pSrc = (BYTE*)bd.Scan0; int st = width * 2;
+        BYTE* pSrc = (BYTE*)bd.Scan0;
+        if (stride == 0) stride = width * 2;
         for (int y = 0; y < height; y++) {
             if (g_bUnloading.load()) break;
             for (int x = 0; x < width; x++) {
@@ -279,7 +256,7 @@ void BlendARGBtoYUY2(BYTE* pData, int width, int height, Gdiplus::Bitmap* pBmp) 
                     BYTE Y = (BYTE)((0.299 * r) + (0.587 * g) + (0.114 * b));
                     BYTE U = (BYTE)(-(0.1687 * r) - (0.3313 * g) + (0.5 * b) + 128);
                     BYTE V = (BYTE)((0.5 * r) - (0.4187 * g) - (0.0813 * b) + 128);
-                    int pos = y * st + x * 2;
+                    int pos = y * stride + x * 2;
                     if (a == 255) { pData[pos] = Y; if (x % 2 == 0) { pData[pos+1] = U; pData[pos+3] = V; } }
                     else { float f = a / 255.0f; pData[pos] = (BYTE)(pData[pos] * (1 - f) + Y * f); }
                 }
@@ -294,6 +271,7 @@ void BlendARGBtoNV12(BYTE* pY, BYTE* pUV, int width, int height, int stride, Gdi
     Gdiplus::BitmapData bd; Gdiplus::Rect rc(0, 0, width, height);
     if (pBmp->LockBits(&rc, Gdiplus::ImageLockModeRead, PixelFormat32bppARGB, &bd) == Gdiplus::Ok) {
         BYTE* pSrc = (BYTE*)bd.Scan0;
+        if (stride == 0) stride = width;
         for (int y = 0; y < height; y++) {
             if (g_bUnloading.load()) break;
             for (int x = 0; x < width; x++) {
@@ -316,7 +294,7 @@ void BlendARGBtoNV12(BYTE* pY, BYTE* pUV, int width, int height, int stride, Gdi
 static void ProcessWatermarkInternal(BYTE* pData, int width, int height, bool isNV12, int stride) {
     if (g_bUnloading.load()) return;
     std::lock_guard<std::mutex> lock(g_drawMutex);
-    if (stride == 0) stride = width;
+    if (stride == 0) stride = isNV12 ? width : width * 2;
     if (RendererManager::Instance().HasSnapshot()) {
         const auto& snap = RendererManager::Instance().GetSnapshot();
         static uint32_t lastSig = 0; uint32_t sig = (uint32_t)snap.Signature();
@@ -324,16 +302,12 @@ static void ProcessWatermarkInternal(BYTE* pData, int width, int height, bool is
         if (g_pWatermarkBmp) {
             std::lock_guard<std::mutex> bmpLock(g_bmpMutex);
             if (isNV12) BlendARGBtoNV12(pData, pData + stride * height, width, height, stride, g_pWatermarkBmp);
-            else BlendARGBtoYUY2(pData, width, height, g_pWatermarkBmp);
+            else BlendARGBtoYUY2(pData, width, height, stride, g_pWatermarkBmp);
             return;
         }
-    }
-    BYTE Y = 76, U = 84, V = 255; int sx = 250, sy = 180;
-    for (int y = -100; y < height; y += sy) {
-        for (int x = -100; x < width; x += sx) {
-            if (isNV12) DrawAgileMarkNV12(pData, pData + stride * height, width, height, stride, x, y, Y, U, V);
-            else DrawAgileMarkYUY2(pData, width, height, x, y, Y, U, V);
-        }
+    } else {
+        static std::atomic<int> logCounter(0);
+        if (logCounter.fetch_add(1) % 300 == 0) DebugLog::log("[WebcamDLL] No snapshot available, skipping watermark.");
     }
 }
 
@@ -366,24 +340,52 @@ static POnReadSample g_origOnReadSample = NULL;
 typedef HRESULT(STDMETHODCALLTYPE* PReadSample)(IMFSourceReader*, DWORD, DWORD, DWORD*, DWORD*, LONGLONG*, IMFSample**);
 static PReadSample g_origReadSample = NULL;
 
-void ProcessMFSample(IMFSample* pS) {
+void ProcessMFSample(IMFSourceReader* pReader, IMFSample* pS) {
     if (!pS || g_bUnloading.load()) return;
     IMFMediaBuffer* pB = NULL;
-    if (SUCCEEDED(pS->ConvertToContiguousBuffer(&pB))) {
-        BYTE* pD = NULL; LONG st = 0; IMF2DBuffer* p2B = NULL;
+    if (FAILED(pS->ConvertToContiguousBuffer(&pB))) return;
+
+    BYTE* pD = NULL; DWORD maxLen = 0, curLen = 0;
+    if (SUCCEEDED(pB->Lock(&pD, &maxLen, &curLen))) {
+        int w = 640, h = 480, stride = 0;
+        bool isNV12 = false;
+
+        if (pReader) {
+            IMFMediaType* pType = NULL;
+            if (SUCCEEDED(pReader->GetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, &pType))) {
+                UINT32 width = 0, height = 0;
+                MFGetAttributeSize(pType, MF_MT_FRAME_SIZE, &width, &height);
+                if (width > 0 && height > 0) { w = (int)width; h = (int)height; }
+                GUID subtype;
+                if (SUCCEEDED(pType->GetGUID(MF_MT_SUBTYPE, &subtype))) isNV12 = (subtype == MFVideoFormat_NV12);
+                UINT32 s = 0;
+                if (SUCCEEDED(pType->GetUINT32(MF_MT_DEFAULT_STRIDE, &s))) stride = (int)s;
+                pType->Release();
+            }
+        }
+
+        IMF2DBuffer* p2B = NULL;
         if (SUCCEEDED(pB->QueryInterface(IID_IMF2DBuffer, (void**)&p2B))) {
-            if (SUCCEEDED(p2B->Lock2D(&pD, &st))) { ProcessWatermark(pD, (int)abs(st), 480, true, (int)abs(st)); p2B->Unlock2D(); }
+            BYTE* pScan0 = NULL; LONG lStride = 0;
+            if (SUCCEEDED(p2B->Lock2D(&pScan0, &lStride))) {
+                ProcessWatermark(pScan0, w, h, isNV12, (int)abs(lStride));
+                p2B->Unlock2D();
+            }
             p2B->Release();
-        } else if (SUCCEEDED(pB->Lock(&pD, NULL, NULL))) { ProcessWatermark(pD, 640, 480, false); pB->Unlock(); }
-        pB->Release();
+        } else {
+            if (stride == 0) stride = isNV12 ? w : w * 2;
+            ProcessWatermark(pD, w, h, isNV12, stride);
+        }
+        pB->Unlock();
     }
+    pB->Release();
 }
 
 HRESULT STDMETHODCALLTYPE HookedOnReadSample(IMFSourceReaderCallback* pS, HRESULT hr, DWORD di, DWORD df, LONGLONG ts, IMFSample* sa) {
-    if (SUCCEEDED(hr) && sa) ProcessMFSample(sa); return g_origOnReadSample(pS, hr, di, df, ts, sa);
+    if (SUCCEEDED(hr) && sa) ProcessMFSample(nullptr, sa); return g_origOnReadSample(pS, hr, di, df, ts, sa);
 }
 HRESULT STDMETHODCALLTYPE HookedReadSample(IMFSourceReader* pS, DWORD di, DWORD df, DWORD* ad, DWORD* sf, LONGLONG* ts, IMFSample** sa) {
-    HRESULT hr = g_origReadSample(pS, di, df, ad, sf, ts, sa); if (SUCCEEDED(hr) && sa && *sa) ProcessMFSample(*sa); return hr;
+    HRESULT hr = g_origReadSample(pS, di, df, ad, sf, ts, sa); if (SUCCEEDED(hr) && sa && *sa) ProcessMFSample(pS, *sa); return hr;
 }
 
 void HookSourceReader(IMFSourceReader* pR, IMFAttributes* pA) {
@@ -420,8 +422,18 @@ static PReceive g_origReceive = NULL;
 HRESULT STDMETHODCALLTYPE HookedReceive(IMemInputPin* pS, IMediaSample* pM) {
     if (pM && !g_bUnloading.load()) {
         BYTE* pB = NULL; if (SUCCEEDED(pM->GetPointer(&pB))) {
-            long len = pM->GetActualDataLength(); int w = 640, h = 480; if (len >= 1280 * 720 * 2) { w = 1280; h = 720; }
-            ProcessWatermark(pB, w, h, false);
+            int w = 640, h = 480, stride = 0; bool isNV12 = false;
+            {
+                std::lock_guard<std::mutex> lk(g_cfgMutex);
+                if (g_videoConfigs.count(pS)) {
+                    const auto& cfg = g_videoConfigs[pS];
+                    w = cfg.width; h = cfg.height; stride = cfg.stride; isNV12 = cfg.isNV12;
+                } else {
+                    long len = pM->GetActualDataLength();
+                    if (len >= 1280 * 720 * 2) { w = 1280; h = 720; }
+                }
+            }
+            ProcessWatermark(pB, w, h, isNV12, stride);
         }
     }
     return g_origReceive(pS, pM);
@@ -430,12 +442,29 @@ HRESULT STDMETHODCALLTYPE HookedReceive(IMemInputPin* pS, IMediaSample* pM) {
 HRESULT STDMETHODCALLTYPE HookedGraphConnect(IGraphBuilder* pS, IPin* pO, IPin* pI) {
     HRESULT hr = g_origGraphConnect(pS, pO, pI);
     if (SUCCEEDED(hr)) {
-        IMemInputPin* pM = NULL; if (SUCCEEDED(pI->QueryInterface(IID_IMemInputPin, (void**)&pM))) {
-            std::lock_guard<std::mutex> lk(g_hookMutex);
-            if (!g_bDShowHooked.load()) {
-                void** vt = *(void***)pM; if (MH_CreateHook(vt[6], &HookedReceive, (LPVOID*)&g_origReceive) == MH_OK) { MH_EnableHook(vt[6]); g_bDShowHooked = true; }
+        AM_MEDIA_TYPE mt;
+        if (SUCCEEDED(pI->ConnectionMediaType(&mt))) {
+            if (mt.formattype == FORMAT_VideoInfo && mt.cbFormat >= sizeof(VIDEOINFOHEADER)) {
+                VIDEOINFOHEADER* vih = (VIDEOINFOHEADER*)mt.pbFormat;
+                VideoConfig cfg;
+                cfg.width = vih->bmiHeader.biWidth;
+                cfg.height = (int)abs(vih->bmiHeader.biHeight);
+                cfg.isNV12 = (mt.subtype == MEDIASUBTYPE_NV12);
+                cfg.stride = (int)(cfg.isNV12 ? cfg.width : (cfg.width * 2));
+                std::lock_guard<std::mutex> lk(g_cfgMutex);
+                IMemInputPin* pM = NULL; 
+                if (SUCCEEDED(pI->QueryInterface(IID_IMemInputPin, (void**)&pM))) {
+                    g_videoConfigs[pM] = cfg;
+                    if (!g_bDShowHooked.load()) {
+                        void** vt = *(void***)pM; 
+                        if (MH_CreateHook(vt[6], &HookedReceive, (LPVOID*)&g_origReceive) == MH_OK) {
+                            MH_EnableHook(vt[6]); g_bDShowHooked = true;
+                        }
+                    }
+                    pM->Release();
+                }
             }
-            pM->Release();
+            FreeMediaType(mt);
         }
     }
     return hr;
@@ -464,20 +493,10 @@ DWORD WINAPI WatchdogThread(LPVOID) {
         if (!found) {
             DebugLog::log("[WebcamDLL] AgileMark not found. Entering Zombie Mode...");
             g_bUnloading = true;
-            
-            // Step 1: Wait for any active drawing calls to drain
             while (g_activeCalls.load() > 0) Sleep(50);
-            
-            // Step 2: Disable all hooks immediately to return Zoom to normal
             MH_DisableHook(MH_ALL_HOOKS);
-            
-            // Step 3: Wait a VERY LONG time (3 seconds) to ensure all Zoom threads 
-            // that were inside our code have returned to Zoom's own memory.
             Sleep(3000);
-            
             DebugLog::log("[WebcamDLL] Safe to terminate. Goodbye.");
-            // We exit the thread, but we don't necessarily need to FreeLibrary if it's too risky.
-            // However, FreeLibraryAndExitThread is standard if we've waited long enough.
             FreeLibraryAndExitThread(g_hModule, 0);
         }
     }
@@ -486,7 +505,18 @@ DWORD WINAPI WatchdogThread(LPVOID) {
 
 extern "C" __declspec(dllexport) DWORD WINAPI StartWatch(LPVOID lp) {
     if (g_bInitialized.exchange(true)) return 0;
-    DebugLog::initialize(); DebugLog::log("[WebcamDLL] StartWatch v18.3.0 (Zombie Protection)");
+    DebugLog::initialize(); DebugLog::log("[WebcamDLL] StartWatch v18.4.0 (Dynamic Resolution)");
+
+    wchar_t modPath[MAX_PATH];
+    if (GetModuleFileNameW(NULL, modPath, MAX_PATH)) {
+        std::wstring path(modPath);
+        for (auto& c : path) c = towlower(c);
+        if (path.find(L"zoom.exe") != std::wstring::npos || path.find(L"teams.exe") != std::wstring::npos) {
+            g_isMirrorMode = true;
+            DebugLog::log("[WebcamDLL] Mirror Mode enabled for this process.");
+        }
+    }
+
     Gdiplus::GdiplusStartupInput gsi; Gdiplus::GdiplusStartup(&g_gdiplusToken, &gsi, NULL);
     g_hIpcThread = CreateThread(NULL, 0, IpcClientThread, NULL, 0, NULL);
     if (MH_Initialize() == MH_OK) {
