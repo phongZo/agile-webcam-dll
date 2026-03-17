@@ -42,9 +42,12 @@ void FreeMediaType(AM_MEDIA_TYPE& mt) {
     }
 }
 
-// Ensure NV12 subtype is defined if not already
+// Ensure common subtypes are defined
 #ifndef MEDIASUBTYPE_NV12
 DEFINE_GUID(MEDIASUBTYPE_NV12, 0x3231564e, 0x0000, 0x0010, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71);
+#endif
+#ifndef MEDIASUBTYPE_MJPG
+DEFINE_GUID(MEDIASUBTYPE_MJPG, 0x47504A4D, 0x0000, 0x0010, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71);
 #endif
 
 using json = nlohmann::json;
@@ -67,6 +70,7 @@ static ULONG_PTR g_gdiplusToken = 0;
 static std::atomic<bool> g_bDShowHooked(false);
 static std::atomic<bool> g_bMFHooked(false);
 static std::atomic<bool> g_bMFCallbackHooked(false);
+static std::atomic<bool> g_bDSConfigHooked(false);
 static bool g_isMirrorMode = false;
 
 struct VideoConfig {
@@ -74,6 +78,8 @@ struct VideoConfig {
     int height = 0;
     int stride = 0;
     bool isNV12 = false;
+    bool isCompressed = false;
+    GUID subtype = GUID_NULL;
 };
 static std::mutex g_cfgMutex;
 static std::map<void*, VideoConfig> g_videoConfigs;
@@ -83,6 +89,16 @@ static const wchar_t* kPipeInject = L"\\\\.\\pipe\\AgileMarkPipe_qaKOab5VPyK4ar4
 
 static Gdiplus::Bitmap* g_pWatermarkBmp = nullptr;
 static std::mutex g_bmpMutex;
+
+// --- Diagnostic Helpers ---
+static std::string GuidToString(const GUID& g) {
+    if (g == MFVideoFormat_YUY2 || g == MEDIASUBTYPE_YUY2) return "YUY2";
+    if (g == MFVideoFormat_NV12 || g == MEDIASUBTYPE_NV12) return "NV12";
+    if (g == MFVideoFormat_MJPG || g == MEDIASUBTYPE_MJPG) return "MJPG (COMPRESSED)";
+    if (g == MFVideoFormat_RGB24 || g == MEDIASUBTYPE_RGB24) return "RGB24";
+    if (g == MFVideoFormat_RGB32 || g == MEDIASUBTYPE_RGB32) return "RGB32";
+    char buf[64]; sprintf_s(buf, "{%08X-...}", g.Data1); return buf;
+}
 
 // --- UTF8 helpers & json getters ---
 static std::wstring Utf8ToUtf16(const std::string& s) {
@@ -183,25 +199,41 @@ static DWORD WINAPI IpcClientThread(LPVOID) {
 }
 
 // --- Macro Expansion Helper ---
+static void ReplaceAllCI(std::wstring& text, const std::wstring& search, const std::wstring& replace) {
+    if (search.empty()) return;
+    std::wstring searchLower = search; for (auto& c : searchLower) c = towlower(c);
+    size_t pos = 0;
+    while (true) {
+        std::wstring textLower = text; for (auto& c : textLower) c = towlower(c);
+        pos = textLower.find(searchLower, pos);
+        if (pos == std::wstring::npos) break;
+        text.replace(pos, search.length(), replace);
+        pos += replace.length();
+    }
+}
+
 static std::wstring ExpandMacros(std::wstring text) {
-    auto ReplaceAll = [&](const std::wstring& search, const std::wstring& replace) {
-        size_t pos = 0;
-        std::wstring searchLower = search; for (auto& c : searchLower) c = towlower(c);
-        while (true) {
-            std::wstring textLower = text; for (auto& c : textLower) c = towlower(c);
-            pos = textLower.find(searchLower, pos);
-            if (pos == std::wstring::npos) break;
-            text.replace(pos, search.length(), replace);
-            pos += replace.length();
-        }
-    };
     wchar_t comp[MAX_COMPUTERNAME_LENGTH + 1]; DWORD sz = ARRAYSIZE(comp);
-    if (GetComputerNameW(comp, &sz)) ReplaceAll(L"{MachineName}", comp);
+    if (GetComputerNameW(comp, &sz)) {
+        ReplaceAllCI(text, L"{MachineName}", comp);
+        ReplaceAllCI(text, L"{machinename}", comp);
+    }
     wchar_t user[256]; DWORD usz = ARRAYSIZE(user);
-    if (GetUserNameW(user, &usz)) ReplaceAll(L"{UserName}", user);
-    SYSTEMTIME st; GetLocalTime(&st); wchar_t buf[64];
-    swprintf_s(buf, L"%02d/%02d/%04d", st.wDay, st.wMonth, st.wYear); ReplaceAll(L"{ShortDate}", buf);
-    swprintf_s(buf, L"%02d:%02d:%02d", st.wHour, st.wMinute, st.wSecond); ReplaceAll(L"{ShortTime}", buf);
+    if (GetUserNameW(user, &usz)) {
+        ReplaceAllCI(text, L"{UserName}", user);
+        ReplaceAllCI(text, L"{username}", user);
+    }
+    SYSTEMTIME st; GetLocalTime(&st);
+    wchar_t shortDate[32]; swprintf_s(shortDate, L"%02d/%02d/%04d", st.wDay, st.wMonth, st.wYear);
+    wchar_t shortTime[32]; swprintf_s(shortTime, L"%02d:%02d", st.wHour, st.wMinute);
+    wchar_t longTime[32];  swprintf_s(longTime, L"%02d:%02d:%02d", st.wHour, st.wMinute, st.wSecond);
+    
+    ReplaceAllCI(text, L"{ShortDate}", shortDate);
+    ReplaceAllCI(text, L"{shortdate}", shortDate);
+    ReplaceAllCI(text, L"{ShortTime}", shortTime);
+    ReplaceAllCI(text, L"{shorttime}", shortTime);
+    ReplaceAllCI(text, L"{LongTime}", longTime);
+    ReplaceAllCI(text, L"{longtime}", longTime);
     return text;
 }
 
@@ -209,9 +241,15 @@ static std::wstring ExpandMacros(std::wstring text) {
 void UpdateWatermarkBitmap(const RenderSnapshot& snap, int width, int height) {
     std::lock_guard<std::mutex> lock(g_bmpMutex);
     if (g_pWatermarkBmp) { delete g_pWatermarkBmp; g_pWatermarkBmp = nullptr; }
-    if (!snap.DrawingEnabled || !snap.TextEnabled || g_bUnloading.load()) return;
+    if (!snap.DrawingEnabled || !snap.TextEnabled || g_bUnloading.load() || width <= 0 || height <= 0) return;
 
     g_pWatermarkBmp = new Gdiplus::Bitmap(width, height, PixelFormat32bppARGB);
+    if (g_pWatermarkBmp->GetLastStatus() != Gdiplus::Ok) {
+        char buf[128]; sprintf_s(buf, "[WebcamDLL][DIAG-GDI] Failed to create bitmap %dx%d, status: %d", width, height, g_pWatermarkBmp->GetLastStatus());
+        DebugLog::log(buf);
+        delete g_pWatermarkBmp; g_pWatermarkBmp = nullptr; return;
+    }
+
     Gdiplus::Graphics g(g_pWatermarkBmp);
     g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
     g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAlias);
@@ -221,35 +259,38 @@ void UpdateWatermarkBitmap(const RenderSnapshot& snap, int width, int height) {
     Gdiplus::FontFamily ff(L"Arial");
     Gdiplus::Font font(&ff, snap.TextSize, Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
     
-    int r = 255, gc = 255, b = 255;
+    unsigned int r = 255, gc = 255, b = 255;
     if (snap.TextColor1.size() == 7 && snap.TextColor1[0] == '#') swscanf_s(snap.TextColor1.c_str(), L"#%02x%02x%02x", &r, &gc, &b);
     Gdiplus::SolidBrush brush(Gdiplus::Color((BYTE)(snap.TextOpacity * 255), (BYTE)r, (BYTE)gc, (BYTE)b));
 
     int sx = (int)snap.TextSpacingX; int sy = (int)snap.TextSpacingY;
     if (sx < 50) sx = 300; if (sy < 50) sy = 200;
 
+    int count = 0;
     for (int y = 0; y < height; y += sy) {
         for (int x = 0; x < width; x += sx) {
             g.ResetTransform(); 
-            if (g_isMirrorMode) {
-                g.ScaleTransform(-1.0f, 1.0f);
-                g.TranslateTransform(-(float)width, 0.0f);
-            }
+            if (g_isMirrorMode) { g.ScaleTransform(-1.0f, 1.0f); g.TranslateTransform(-(float)width, 0.0f); }
             g.TranslateTransform((float)x, (float)y); g.RotateTransform(snap.TextAngleDeg);
-            g.DrawString(text.c_str(), -1, &font, Gdiplus::PointF(0, 0), &brush);
+            if (g.DrawString(text.c_str(), -1, &font, Gdiplus::PointF(0, 0), &brush) == Gdiplus::Ok) count++;
         }
     }
+    char buf[128]; sprintf_s(buf, "[WebcamDLL][DIAG-GDI] Bitmap %dx%d ready. Drawn %d times.", width, height, count);
+    DebugLog::log(buf);
 }
 
 void BlendARGBtoYUY2(BYTE* pData, int width, int height, int stride, Gdiplus::Bitmap* pBmp) {
     if (!pBmp || g_bUnloading.load()) return;
-    Gdiplus::BitmapData bd; Gdiplus::Rect rc(0, 0, width, height);
+    Gdiplus::BitmapData bd; Gdiplus::Rect rc(0, 0, pBmp->GetWidth(), pBmp->GetHeight());
     if (pBmp->LockBits(&rc, Gdiplus::ImageLockModeRead, PixelFormat32bppARGB, &bd) == Gdiplus::Ok) {
         BYTE* pSrc = (BYTE*)bd.Scan0;
+        int bmpW = (int)pBmp->GetWidth(); int bmpH = (int)pBmp->GetHeight();
+        int drawW = (width < bmpW) ? width : bmpW;
+        int drawH = (height < bmpH) ? height : bmpH;
         if (stride == 0) stride = width * 2;
-        for (int y = 0; y < height; y++) {
+        for (int y = 0; y < drawH; y++) {
             if (g_bUnloading.load()) break;
-            for (int x = 0; x < width; x++) {
+            for (int x = 0; x < drawW; x++) {
                 BYTE* pPx = pSrc + (y * bd.Stride) + (x * 4); BYTE a = pPx[3];
                 if (a > 0) {
                     int r = pPx[2], g = pPx[1], b = pPx[0];
@@ -258,7 +299,14 @@ void BlendARGBtoYUY2(BYTE* pData, int width, int height, int stride, Gdiplus::Bi
                     BYTE V = (BYTE)((0.5 * r) - (0.4187 * g) - (0.0813 * b) + 128);
                     int pos = y * stride + x * 2;
                     if (a == 255) { pData[pos] = Y; if (x % 2 == 0) { pData[pos+1] = U; pData[pos+3] = V; } }
-                    else { float f = a / 255.0f; pData[pos] = (BYTE)(pData[pos] * (1 - f) + Y * f); }
+                    else { 
+                        float f = a / 255.0f; 
+                        pData[pos] = (BYTE)(pData[pos] * (1.0f - f) + Y * f); 
+                        if (x % 2 == 0) {
+                            pData[pos+1] = (BYTE)(pData[pos+1] * (1.0f - f) + U * f);
+                            pData[pos+3] = (BYTE)(pData[pos+3] * (1.0f - f) + V * f);
+                        }
+                    }
                 }
             }
         }
@@ -268,21 +316,39 @@ void BlendARGBtoYUY2(BYTE* pData, int width, int height, int stride, Gdiplus::Bi
 
 void BlendARGBtoNV12(BYTE* pY, BYTE* pUV, int width, int height, int stride, Gdiplus::Bitmap* pBmp) {
     if (!pBmp || g_bUnloading.load()) return;
-    Gdiplus::BitmapData bd; Gdiplus::Rect rc(0, 0, width, height);
+    Gdiplus::BitmapData bd; Gdiplus::Rect rc(0, 0, pBmp->GetWidth(), pBmp->GetHeight());
     if (pBmp->LockBits(&rc, Gdiplus::ImageLockModeRead, PixelFormat32bppARGB, &bd) == Gdiplus::Ok) {
         BYTE* pSrc = (BYTE*)bd.Scan0;
+        int bmpW = (int)pBmp->GetWidth(); int bmpH = (int)pBmp->GetHeight();
+        int drawW = (width < bmpW) ? width : bmpW;
+        int drawH = (height < bmpH) ? height : bmpH;
         if (stride == 0) stride = width;
-        for (int y = 0; y < height; y++) {
+        for (int y = 0; y < drawH; y++) {
             if (g_bUnloading.load()) break;
-            for (int x = 0; x < width; x++) {
+            for (int x = 0; x < drawW; x++) {
                 BYTE* pPx = pSrc + (y * bd.Stride) + (x * 4); BYTE a = pPx[3];
                 if (a > 0) {
                     int r = pPx[2], g = pPx[1], b = pPx[0];
                     BYTE Y = (BYTE)((0.299 * r) + (0.587 * g) + (0.114 * b));
                     BYTE U = (BYTE)(-(0.1687 * r) - (0.3313 * g) + (0.5 * b) + 128);
                     BYTE V = (BYTE)((0.5 * r) - (0.4187 * g) - (0.0813 * b) + 128);
-                    if (a == 255) { pY[y * stride + x] = Y; if (x % 2 == 0 && y % 2 == 0) { int up = (y / 2) * stride + x; pUV[up] = U; pUV[up+1] = V; } }
-                    else { float f = a / 255.0f; pY[y * stride + x] = (BYTE)(pY[y * stride + x] * (1 - f) + Y * f); }
+                    int y_pos = y * stride + x;
+                    if (a == 255) { 
+                        pY[y_pos] = Y; 
+                        if (x % 2 == 0 && y % 2 == 0) { 
+                            int uv_pos = (y / 2) * stride + x; 
+                            pUV[uv_pos] = U; pUV[uv_pos+1] = V; 
+                        } 
+                    }
+                    else { 
+                        float f = a / 255.0f; 
+                        pY[y_pos] = (BYTE)(pY[y_pos] * (1.0f - f) + Y * f); 
+                        if (x % 2 == 0 && y % 2 == 0) {
+                            int uv_pos = (y / 2) * stride + x;
+                            pUV[uv_pos] = (BYTE)(pUV[uv_pos] * (1.0f - f) + U * f);
+                            pUV[uv_pos+1] = (BYTE)(pUV[uv_pos+1] * (1.0f - f) + V * f);
+                        }
+                    }
                 }
             }
         }
@@ -291,40 +357,66 @@ void BlendARGBtoNV12(BYTE* pY, BYTE* pUV, int width, int height, int stride, Gdi
 }
 
 // Actual drawing logic with C++ objects
-static void ProcessWatermarkInternal(BYTE* pData, int width, int height, bool isNV12, int stride) {
-    if (g_bUnloading.load()) return;
+static void ProcessWatermarkInternal(BYTE* pData, int width, int height, bool isNV12, int stride, bool isCompressed) {
+    if (g_bUnloading.load() || isCompressed || !pData) return;
+    
+    if (g_gdiplusToken == 0) {
+        Gdiplus::GdiplusStartupInput gsi;
+        Gdiplus::GdiplusStartup(&g_gdiplusToken, &gsi, NULL);
+    }
+
     std::lock_guard<std::mutex> lock(g_drawMutex);
-    if (stride == 0) stride = isNV12 ? width : width * 2;
+    if (stride <= 0) stride = isNV12 ? width : (width * 2);
+
     if (RendererManager::Instance().HasSnapshot()) {
         const auto& snap = RendererManager::Instance().GetSnapshot();
-        static uint32_t lastSig = 0; uint32_t sig = (uint32_t)snap.Signature();
-        if (sig != lastSig || !g_pWatermarkBmp) { UpdateWatermarkBitmap(snap, width, height); lastSig = sig; }
+        static uint32_t lastSig = 0; 
+        static int lastW = 0, lastH = 0;
+        uint32_t sig = (uint32_t)snap.Signature();
+        
+        if (sig != lastSig || width != lastW || height != lastH || !g_pWatermarkBmp) { 
+            UpdateWatermarkBitmap(snap, width, height); 
+            lastSig = sig; lastW = width; lastH = height;
+        }
+
         if (g_pWatermarkBmp) {
             std::lock_guard<std::mutex> bmpLock(g_bmpMutex);
-            if (isNV12) BlendARGBtoNV12(pData, pData + stride * height, width, height, stride, g_pWatermarkBmp);
-            else BlendARGBtoYUY2(pData, width, height, stride, g_pWatermarkBmp);
-            return;
+            if (isNV12) {
+                BlendARGBtoNV12(pData, pData + (stride * height), width, height, stride, g_pWatermarkBmp);
+            } else {
+                BlendARGBtoYUY2(pData, width, height, stride, g_pWatermarkBmp);
+            }
         }
     } else {
-        static std::atomic<int> logCounter(0);
-        if (logCounter.fetch_add(1) % 300 == 0) DebugLog::log("[WebcamDLL] No snapshot available, skipping watermark.");
+        static std::atomic<int> noSnapCounter(0);
+        if (noSnapCounter.fetch_add(1) % 500 == 0) {
+            DebugLog::log("[WebcamDLL][DIAG-GDI] Drawing skipped: Waiting for snapshot.");
+        }
     }
 }
 
-// Strictly follow SEH rules
+// Strictly follow SEH rules - No C++ objects in this specific function scope
 #pragma runtime_checks("", off)
-static void SafeDrawWrapper(BYTE* pData, int width, int height, bool isNV12, int stride) {
+static void RawDrawWrapper(BYTE* pData, int width, int height, bool isNV12, int stride, bool isCompressed) {
     __try {
-        ProcessWatermarkInternal(pData, width, height, isNV12, stride);
+        ProcessWatermarkInternal(pData, width, height, isNV12, stride, isCompressed);
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 #pragma runtime_checks("", restore)
 
-void ProcessWatermark(BYTE* pData, int width, int height, bool isNV12, int stride = 0) {
+void ProcessWatermark(BYTE* pData, int width, int height, bool isNV12, int stride, bool isCompressed) {
     if (g_bUnloading.load() || !pData) return;
+    
+    static std::atomic<int> entryCounter(0);
+    if (entryCounter.fetch_add(1) % 500 == 0) {
+        char buf[128];
+        sprintf_s(buf, "[WebcamDLL][DIAG-GDI] ProcessWatermark entered (%dx%d, isNV12=%d)", width, height, (int)isNV12);
+        DebugLog::log(buf);
+    }
+
     g_activeCalls++;
-    SafeDrawWrapper(pData, width, height, isNV12, stride);
+    RawDrawWrapper(pData, width, height, isNV12, stride, isCompressed);
     g_activeCalls--;
 }
 
@@ -339,6 +431,19 @@ typedef HRESULT(STDMETHODCALLTYPE* POnReadSample)(IMFSourceReaderCallback*, HRES
 static POnReadSample g_origOnReadSample = NULL;
 typedef HRESULT(STDMETHODCALLTYPE* PReadSample)(IMFSourceReader*, DWORD, DWORD, DWORD*, DWORD*, LONGLONG*, IMFSample**);
 static PReadSample g_origReadSample = NULL;
+typedef HRESULT(STDMETHODCALLTYPE* PSetCurrentMediaType)(IMFSourceReader*, DWORD, DWORD*, IMFMediaType*);
+static PSetCurrentMediaType g_origMFSetCurrentMediaType = NULL;
+
+HRESULT STDMETHODCALLTYPE HookedMFSetCurrentMediaType(IMFSourceReader* pS, DWORD di, DWORD* pr, IMFMediaType* pType) {
+    GUID subtype;
+    if (pType && SUCCEEDED(pType->GetGUID(MF_MT_SUBTYPE, &subtype))) {
+        if (subtype == MFVideoFormat_MJPG) {
+            DebugLog::log("[WebcamDLL][FILTER] Blocking MF MJPG request to force YUY2/NV12 fallback.");
+            return MF_E_INVALIDMEDIATYPE;
+        }
+    }
+    return g_origMFSetCurrentMediaType(pS, di, pr, pType);
+}
 
 void ProcessMFSample(IMFSourceReader* pReader, IMFSample* pS) {
     if (!pS || g_bUnloading.load()) return;
@@ -348,7 +453,8 @@ void ProcessMFSample(IMFSourceReader* pReader, IMFSample* pS) {
     BYTE* pD = NULL; DWORD maxLen = 0, curLen = 0;
     if (SUCCEEDED(pB->Lock(&pD, &maxLen, &curLen))) {
         int w = 640, h = 480, stride = 0;
-        bool isNV12 = false;
+        bool isNV12 = false, isMJPG = false;
+        GUID subtype = GUID_NULL;
 
         if (pReader) {
             IMFMediaType* pType = NULL;
@@ -356,25 +462,42 @@ void ProcessMFSample(IMFSourceReader* pReader, IMFSample* pS) {
                 UINT32 width = 0, height = 0;
                 MFGetAttributeSize(pType, MF_MT_FRAME_SIZE, &width, &height);
                 if (width > 0 && height > 0) { w = (int)width; h = (int)height; }
-                GUID subtype;
-                if (SUCCEEDED(pType->GetGUID(MF_MT_SUBTYPE, &subtype))) isNV12 = (subtype == MFVideoFormat_NV12);
+                if (SUCCEEDED(pType->GetGUID(MF_MT_SUBTYPE, &subtype))) {
+                    isNV12 = (subtype == MFVideoFormat_NV12);
+                    isMJPG = (subtype == MFVideoFormat_MJPG);
+                }
                 UINT32 s = 0;
                 if (SUCCEEDED(pType->GetUINT32(MF_MT_DEFAULT_STRIDE, &s))) stride = (int)s;
                 pType->Release();
             }
         }
 
-        IMF2DBuffer* p2B = NULL;
-        if (SUCCEEDED(pB->QueryInterface(IID_IMF2DBuffer, (void**)&p2B))) {
-            BYTE* pScan0 = NULL; LONG lStride = 0;
-            if (SUCCEEDED(p2B->Lock2D(&pScan0, &lStride))) {
-                ProcessWatermark(pScan0, w, h, isNV12, (int)abs(lStride));
-                p2B->Unlock2D();
+        if (!isMJPG && curLen > 0 && curLen < (DWORD)(w * h)) isMJPG = true;
+
+        static std::atomic<int> diagCounter(0);
+        if (diagCounter.fetch_add(1) % 300 == 0) {
+            char buf[256];
+            sprintf_s(buf, "[WebcamDLL][DIAG-MF] Res: %dx%d, Subtype: %s, Stride: %d, BufferLen: %u%s", 
+                w, h, GuidToString(subtype).c_str(), stride, curLen, isMJPG ? " [SKIPPED]" : "");
+            DebugLog::log(buf);
+        }
+
+        if (!isMJPG) {
+            IMF2DBuffer* p2B = NULL;
+            if (SUCCEEDED(pB->QueryInterface(IID_IMF2DBuffer, (void**)&p2B))) {
+                BYTE* pScan0 = NULL; LONG lStride = 0;
+                if (SUCCEEDED(p2B->Lock2D(&pScan0, &lStride))) {
+                    ProcessWatermark(pScan0, w, h, isNV12, (int)abs(lStride), false);
+                    p2B->Unlock2D();
+                } else {
+                    if (stride == 0) stride = isNV12 ? w : w * 2;
+                    ProcessWatermark(pD, w, h, isNV12, stride, false);
+                }
+                p2B->Release();
+            } else {
+                if (stride == 0) stride = isNV12 ? w : w * 2;
+                ProcessWatermark(pD, w, h, isNV12, stride, false);
             }
-            p2B->Release();
-        } else {
-            if (stride == 0) stride = isNV12 ? w : w * 2;
-            ProcessWatermark(pD, w, h, isNV12, stride);
         }
         pB->Unlock();
     }
@@ -390,12 +513,14 @@ HRESULT STDMETHODCALLTYPE HookedReadSample(IMFSourceReader* pS, DWORD di, DWORD 
 
 void HookSourceReader(IMFSourceReader* pR, IMFAttributes* pA) {
     if (!pR) return; std::lock_guard<std::mutex> lk(g_hookMutex);
+    void** vt = *(void***)pR;
     if (!g_bMFHooked.load()) {
-        void** vt = *(void***)pR; if (MH_CreateHook(vt[9], &HookedReadSample, (LPVOID*)&g_origReadSample) == MH_OK) { MH_EnableHook(vt[9]); g_bMFHooked = true; }
+        if (MH_CreateHook(vt[7], &HookedMFSetCurrentMediaType, (LPVOID*)&g_origMFSetCurrentMediaType) == MH_OK) MH_EnableHook(vt[7]);
+        if (MH_CreateHook(vt[9], &HookedReadSample, (LPVOID*)&g_origReadSample) == MH_OK) { MH_EnableHook(vt[9]); g_bMFHooked = true; }
     }
     if (pA && !g_bMFCallbackHooked.load()) {
         IUnknown* pC = NULL; if (SUCCEEDED(pA->GetUnknown(MF_SOURCE_READER_ASYNC_CALLBACK, IID_IUnknown, (LPVOID*)&pC))) {
-            void** vt = *(void***)pC; if (MH_CreateHook(vt[3], &HookedOnReadSample, (LPVOID*)&g_origOnReadSample) == MH_OK) { MH_EnableHook(vt[3]); g_bMFCallbackHooked = true; }
+            void** vtC = *(void***)pC; if (MH_CreateHook(vtC[3], &HookedOnReadSample, (LPVOID*)&g_origOnReadSample) == MH_OK) { MH_EnableHook(vtC[3]); g_bMFCallbackHooked = true; }
             pC->Release();
         }
     }
@@ -418,22 +543,41 @@ typedef HRESULT(STDMETHODCALLTYPE* PGraphConnect)(IGraphBuilder*, IPin*, IPin*);
 static PGraphConnect g_origGraphConnect = NULL;
 typedef HRESULT(STDMETHODCALLTYPE* PReceive)(IMemInputPin*, IMediaSample*);
 static PReceive g_origReceive = NULL;
+typedef HRESULT(STDMETHODCALLTYPE* PDSSetFormat)(IAMStreamConfig*, AM_MEDIA_TYPE*);
+static PDSSetFormat g_origDSSetFormat = NULL;
+
+HRESULT STDMETHODCALLTYPE HookedDSSetFormat(IAMStreamConfig* pS, AM_MEDIA_TYPE* pmt) {
+    if (pmt && pmt->subtype == MEDIASUBTYPE_MJPG) {
+        DebugLog::log("[WebcamDLL][FILTER] Blocking DirectShow MJPG request to force fallback.");
+        return E_FAIL;
+    }
+    return g_origDSSetFormat(pS, pmt);
+}
 
 HRESULT STDMETHODCALLTYPE HookedReceive(IMemInputPin* pS, IMediaSample* pM) {
     if (pM && !g_bUnloading.load()) {
         BYTE* pB = NULL; if (SUCCEEDED(pM->GetPointer(&pB))) {
-            int w = 640, h = 480, stride = 0; bool isNV12 = false;
+            int w = 640, h = 480, stride = 0; 
+            bool isNV12 = false, isMJPG = false;
+            GUID subtype = GUID_NULL;
             {
                 std::lock_guard<std::mutex> lk(g_cfgMutex);
                 if (g_videoConfigs.count(pS)) {
                     const auto& cfg = g_videoConfigs[pS];
-                    w = cfg.width; h = cfg.height; stride = cfg.stride; isNV12 = cfg.isNV12;
-                } else {
-                    long len = pM->GetActualDataLength();
-                    if (len >= 1280 * 720 * 2) { w = 1280; h = 720; }
+                    w = cfg.width; h = cfg.height; stride = cfg.stride; isNV12 = cfg.isNV12; 
+                    subtype = cfg.subtype; isMJPG = cfg.isCompressed;
                 }
             }
-            ProcessWatermark(pB, w, h, isNV12, stride);
+            if (!isMJPG && pM->GetActualDataLength() < (long)(w * h)) isMJPG = true;
+
+            static std::atomic<int> diagCounter(0);
+            if (diagCounter.fetch_add(1) % 300 == 0) {
+                char buf[256];
+                sprintf_s(buf, "[WebcamDLL][DIAG-DS] Res: %dx%d, Subtype: %s, Stride: %d, BufferLen: %ld%s", 
+                    w, h, GuidToString(subtype).c_str(), stride, pM->GetActualDataLength(), isMJPG ? " [SKIPPED]" : "");
+                DebugLog::log(buf);
+            }
+            if (!isMJPG) ProcessWatermark(pB, w, h, isNV12, stride, false);
         }
     }
     return g_origReceive(pS, pM);
@@ -442,6 +586,18 @@ HRESULT STDMETHODCALLTYPE HookedReceive(IMemInputPin* pS, IMediaSample* pM) {
 HRESULT STDMETHODCALLTYPE HookedGraphConnect(IGraphBuilder* pS, IPin* pO, IPin* pI) {
     HRESULT hr = g_origGraphConnect(pS, pO, pI);
     if (SUCCEEDED(hr)) {
+        // Try to block MJPG on the stream configuration
+        IAMStreamConfig* pConfig = NULL;
+        if (SUCCEEDED(pO->QueryInterface(IID_IAMStreamConfig, (void**)&pConfig))) {
+            void** vtC = *(void***)pConfig;
+            if (!g_bDSConfigHooked.load()) {
+                if (MH_CreateHook(vtC[3], &HookedDSSetFormat, (LPVOID*)&g_origDSSetFormat) == MH_OK) {
+                    MH_EnableHook(vtC[3]); g_bDSConfigHooked = true;
+                }
+            }
+            pConfig->Release();
+        }
+
         AM_MEDIA_TYPE mt;
         if (SUCCEEDED(pI->ConnectionMediaType(&mt))) {
             if (mt.formattype == FORMAT_VideoInfo && mt.cbFormat >= sizeof(VIDEOINFOHEADER)) {
@@ -449,7 +605,9 @@ HRESULT STDMETHODCALLTYPE HookedGraphConnect(IGraphBuilder* pS, IPin* pO, IPin* 
                 VideoConfig cfg;
                 cfg.width = vih->bmiHeader.biWidth;
                 cfg.height = (int)abs(vih->bmiHeader.biHeight);
+                cfg.subtype = mt.subtype;
                 cfg.isNV12 = (mt.subtype == MEDIASUBTYPE_NV12);
+                cfg.isCompressed = (mt.subtype == MEDIASUBTYPE_MJPG);
                 cfg.stride = (int)(cfg.isNV12 ? cfg.width : (cfg.width * 2));
                 std::lock_guard<std::mutex> lk(g_cfgMutex);
                 IMemInputPin* pM = NULL; 
@@ -491,7 +649,7 @@ DWORD WINAPI WatchdogThread(LPVOID) {
         if (Process32FirstW(h, &pe)) { do { if (_wcsicmp(pe.szExeFile, L"AgileMark.exe") == 0) { found = true; break; } } while (Process32NextW(h, &pe)); }
         CloseHandle(h);
         if (!found) {
-            DebugLog::log("[WebcamDLL] AgileMark not found. Entering Zombie Mode...");
+            DebugLog::log("[WebcamDLL] AgileMark not found");
             g_bUnloading = true;
             while (g_activeCalls.load() > 0) Sleep(50);
             MH_DisableHook(MH_ALL_HOOKS);
@@ -505,13 +663,13 @@ DWORD WINAPI WatchdogThread(LPVOID) {
 
 extern "C" __declspec(dllexport) DWORD WINAPI StartWatch(LPVOID lp) {
     if (g_bInitialized.exchange(true)) return 0;
-    DebugLog::initialize(); DebugLog::log("[WebcamDLL] StartWatch v18.4.0 (Dynamic Resolution)");
+    DebugLog::initialize(); DebugLog::log("[WebcamDLL] StartWatch");
 
     wchar_t modPath[MAX_PATH];
     if (GetModuleFileNameW(NULL, modPath, MAX_PATH)) {
         std::wstring path(modPath);
         for (auto& c : path) c = towlower(c);
-        if (path.find(L"zoom.exe") != std::wstring::npos || path.find(L"teams.exe") != std::wstring::npos) {
+        if (path.find(L"zoom.exe") != std::wstring::npos || path.find(L"ms-teams.exe") != std::wstring::npos) {
             g_isMirrorMode = true;
             DebugLog::log("[WebcamDLL] Mirror Mode enabled for this process.");
         }
