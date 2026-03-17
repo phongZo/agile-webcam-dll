@@ -59,7 +59,7 @@ boolean RendererManager::SetSnapshot(const RenderSnapshot& snap)
 		std::lock_guard<std::mutex> lk(m_mx);
 
 		if (m_hasSnapshot && sig == m_lastSig) {
-			DebugLog::log("[DComp][SNAP] SetSnapshot: unchanged -> skip");
+			//DebugLog::log("[DComp][SNAP] SetSnapshot: unchanged -> skip");
 			return false;
 		}
 
