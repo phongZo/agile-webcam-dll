@@ -18,6 +18,7 @@ private:
 
 	static std::string logFilePath;
 	static std::ofstream logFile;
+	static HANDLE hLogMutex;
 	static std::string processName;
 	static DWORD processID;
 

@@ -15,6 +15,7 @@
 
 std::string DebugLog::logFilePath;
 std::ofstream DebugLog::logFile;
+HANDLE DebugLog::hLogMutex = NULL;
 std::string DebugLog::processName;
 DWORD DebugLog::processID;
 bool DebugLog::initialized = false;
@@ -22,6 +23,9 @@ bool DebugLog::initialized = false;
 void DebugLog::initialize() {
 	if (!initialized) {
 		processID = GetCurrentProcessId();
+		
+		// Create a Global Mutex to sync logging across all processes (Zoom, Teams, etc.)
+		hLogMutex = CreateMutexA(NULL, FALSE, "Global\\AgileMark_WebcamDLL_LogMutex");
 		
 		char procName[MAX_PATH] = "<unknown>";
 		HMODULE hMod;
@@ -45,13 +49,7 @@ void DebugLog::initialize() {
 		if (pathFound) {
 			std::string baseDir = std::string(path) + "\\AgileMark";
 			CreateDirectoryA(baseDir.c_str(), NULL);
-			
-			logFilePath = baseDir + "\\webcam_dll.log";
-
-			logFile.open(logFilePath, std::ios::out | std::ios::app);
-			if (!logFile.is_open()) {
-				OutputDebugStringA("[WebcamDLL] Failed to open log file in Roaming AppData.");
-			}
+			logFilePath = baseDir + "\\webcamdll.log";
 		}
 		
 		std::string startMsg = "[WebcamDLL] Initialized in " + processName + " (PID: " + std::to_string(processID) + ")";
@@ -78,8 +76,21 @@ void DebugLog::log(const std::string& message) {
 	// Always output to debugger (can be seen with DebugView)
 	OutputDebugStringA(formatted.c_str());
 
-	if (logFile.is_open()) {
-		logFile << formatted << std::endl;
-		logFile.flush(); // Force write to disk
+	if (!logFilePath.empty()) {
+		// Use Global Mutex to avoid log corruption and allow rotation
+		if (hLogMutex) {
+			DWORD waitResult = WaitForSingleObject(hLogMutex, 500); 
+			if (waitResult == WAIT_OBJECT_0 || waitResult == WAIT_ABANDONED) {
+				// Open-Write-Close pattern: This allows AgileMark to zip/rotate the file when the mutex is free
+				std::ofstream out(logFilePath, std::ios::out | std::ios::app);
+				if (out.is_open()) {
+					out << formatted << std::endl;
+					out.close();
+				}
+				ReleaseMutex(hLogMutex);
+			} else {
+				OutputDebugStringA("[WebcamDLL][ERROR] Log Mutex Timeout.");
+			}
+		}
 	}
 }
