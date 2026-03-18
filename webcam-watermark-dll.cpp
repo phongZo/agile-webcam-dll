@@ -73,6 +73,10 @@ static std::atomic<bool> g_bMFCallbackHooked(false);
 static std::atomic<bool> g_bDSConfigHooked(false);
 static bool g_isMirrorMode = false;
 
+// Map to link Async Callbacks to their parent SourceReaders (Critical for Teams/Async MF)
+static std::map<void*, void*> g_mfCallbackToReader;
+static std::mutex g_mfMapMutex;
+
 struct VideoConfig {
     int width = 0;
     int height = 0;
@@ -445,7 +449,7 @@ HRESULT STDMETHODCALLTYPE HookedMFSetCurrentMediaType(IMFSourceReader* pS, DWORD
     return g_origMFSetCurrentMediaType(pS, di, pr, pType);
 }
 
-void ProcessMFSample(IMFSourceReader* pReader, IMFSample* pS) {
+void ProcessMFSample(IMFSourceReader* pReader, IMFSample* pS, DWORD dwStreamIndex) {
     if (!pS || g_bUnloading.load()) return;
     IMFMediaBuffer* pB = NULL;
     if (FAILED(pS->ConvertToContiguousBuffer(&pB))) return;
@@ -458,7 +462,7 @@ void ProcessMFSample(IMFSourceReader* pReader, IMFSample* pS) {
 
         if (pReader) {
             IMFMediaType* pType = NULL;
-            if (SUCCEEDED(pReader->GetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, &pType))) {
+            if (SUCCEEDED(pReader->GetCurrentMediaType(dwStreamIndex, &pType))) {
                 UINT32 width = 0, height = 0;
                 MFGetAttributeSize(pType, MF_MT_FRAME_SIZE, &width, &height);
                 if (width > 0 && height > 0) { w = (int)width; h = (int)height; }
@@ -477,8 +481,8 @@ void ProcessMFSample(IMFSourceReader* pReader, IMFSample* pS) {
         static std::atomic<int> diagCounter(0);
         if (diagCounter.fetch_add(1) % 300 == 0) {
             char buf[256];
-            sprintf_s(buf, "[WebcamDLL][DIAG-MF] Res: %dx%d, Subtype: %s, Stride: %d, BufferLen: %u%s", 
-                w, h, GuidToString(subtype).c_str(), stride, curLen, isMJPG ? " [SKIPPED]" : "");
+            sprintf_s(buf, "[WebcamDLL][DIAG-MF] Stream:%u Res:%dx%d, Subtype:%s, Stride:%d, Len:%u%s", 
+                dwStreamIndex, w, h, GuidToString(subtype).c_str(), stride, curLen, isMJPG ? " [SKIPPED]" : "");
             DebugLog::log(buf);
         }
 
@@ -505,10 +509,23 @@ void ProcessMFSample(IMFSourceReader* pReader, IMFSample* pS) {
 }
 
 HRESULT STDMETHODCALLTYPE HookedOnReadSample(IMFSourceReaderCallback* pS, HRESULT hr, DWORD di, DWORD df, LONGLONG ts, IMFSample* sa) {
-    if (SUCCEEDED(hr) && sa) ProcessMFSample(nullptr, sa); return g_origOnReadSample(pS, hr, di, df, ts, sa);
+    void* pReader = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_mfMapMutex);
+        if (g_mfCallbackToReader.count(pS)) {
+            pReader = g_mfCallbackToReader[pS];
+        }
+    }
+    if (SUCCEEDED(hr) && sa) ProcessMFSample((IMFSourceReader*)pReader, sa, di); 
+    return g_origOnReadSample(pS, hr, di, df, ts, sa);
 }
 HRESULT STDMETHODCALLTYPE HookedReadSample(IMFSourceReader* pS, DWORD di, DWORD df, DWORD* ad, DWORD* sf, LONGLONG* ts, IMFSample** sa) {
-    HRESULT hr = g_origReadSample(pS, di, df, ad, sf, ts, sa); if (SUCCEEDED(hr) && sa && *sa) ProcessMFSample(pS, *sa); return hr;
+    HRESULT hr = g_origReadSample(pS, di, df, ad, sf, ts, sa); 
+    if (SUCCEEDED(hr) && sa && *sa) {
+        DWORD dwActualIndex = (ad != nullptr) ? *ad : di;
+        ProcessMFSample(pS, *sa, dwActualIndex);
+    }
+    return hr;
 }
 
 void HookSourceReader(IMFSourceReader* pR, IMFAttributes* pA) {
@@ -518,9 +535,21 @@ void HookSourceReader(IMFSourceReader* pR, IMFAttributes* pA) {
         if (MH_CreateHook(vt[7], &HookedMFSetCurrentMediaType, (LPVOID*)&g_origMFSetCurrentMediaType) == MH_OK) MH_EnableHook(vt[7]);
         if (MH_CreateHook(vt[9], &HookedReadSample, (LPVOID*)&g_origReadSample) == MH_OK) { MH_EnableHook(vt[9]); g_bMFHooked = true; }
     }
-    if (pA && !g_bMFCallbackHooked.load()) {
-        IUnknown* pC = NULL; if (SUCCEEDED(pA->GetUnknown(MF_SOURCE_READER_ASYNC_CALLBACK, IID_IUnknown, (LPVOID*)&pC))) {
-            void** vtC = *(void***)pC; if (MH_CreateHook(vtC[3], &HookedOnReadSample, (LPVOID*)&g_origOnReadSample) == MH_OK) { MH_EnableHook(vtC[3]); g_bMFCallbackHooked = true; }
+    if (pA) {
+        IUnknown* pC = NULL; 
+        if (SUCCEEDED(pA->GetUnknown(MF_SOURCE_READER_ASYNC_CALLBACK, IID_IUnknown, (LPVOID*)&pC))) {
+            {
+                std::lock_guard<std::mutex> lkMap(g_mfMapMutex);
+                g_mfCallbackToReader[pC] = pR;
+            }
+            void** vtC = *(void***)pC; 
+            // MinHook will handle deduplication if the address vtC[3] is already hooked
+            if (MH_CreateHook(vtC[3], &HookedOnReadSample, (LPVOID*)&g_origOnReadSample) == MH_OK) { 
+                MH_EnableHook(vtC[3]); 
+                g_bMFCallbackHooked = true; 
+            } else {
+                MH_EnableHook(vtC[3]); // Always ensure it is enabled
+            }
             pC->Release();
         }
     }
