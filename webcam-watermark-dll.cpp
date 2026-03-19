@@ -177,9 +177,20 @@ static void ProcessPipeLineBuffer(std::string& buffer) {
         if (line.empty()) continue;
         try {
             auto j = json::parse(line);
-            RenderSnapshot snap;
-            if (TryParseSnapshotFromJson(j, snap)) {
-                RendererManager::Instance().SetSnapshot(snap);
+            if (!j.contains("CMD") || !j["CMD"].is_string()) continue;
+
+            std::string cmd = j["CMD"].get<std::string>();
+            if (cmd == "UnloadDLL") {
+                DebugLog::log("[WebcamDLL][IPC] Received UnloadDLL. Triggering exit...");
+                g_bUnloading = true;
+                return;
+            } else if (cmd == "UpdateMarkerDLL") {
+                RenderSnapshot snap;
+                if (TryParseSnapshotFromJson(j, snap)) {
+                    RendererManager::Instance().SetSnapshot(snap);
+                }
+            } else {
+                continue;
             }
         } catch (...) {}
     }
@@ -202,7 +213,6 @@ static DWORD WINAPI IpcClientThread(LPVOID) {
     return 0;
 }
 
-// --- Macro Expansion Helper ---
 static void ReplaceAllCI(std::wstring& text, const std::wstring& search, const std::wstring& replace) {
     if (search.empty()) return;
     std::wstring searchLower = search; for (auto& c : searchLower) c = towlower(c);
@@ -263,20 +273,73 @@ void UpdateWatermarkBitmap(const RenderSnapshot& snap, int width, int height) {
     Gdiplus::FontFamily ff(L"Arial");
     Gdiplus::Font font(&ff, snap.TextSize, Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
     
-    unsigned int r = 255, gc = 255, b = 255;
-    if (snap.TextColor1.size() == 7 && snap.TextColor1[0] == '#') swscanf_s(snap.TextColor1.c_str(), L"#%02x%02x%02x", &r, &gc, &b);
-    Gdiplus::SolidBrush brush(Gdiplus::Color((BYTE)(snap.TextOpacity * 255), (BYTE)r, (BYTE)gc, (BYTE)b));
+    unsigned int r1 = 0, g1 = 0, b1 = 0, r2 = 255, g2 = 255, b2 = 255;
+    if (snap.TextColor1.size() == 7 && snap.TextColor1[0] == '#') swscanf_s(snap.TextColor1.c_str(), L"#%02x%02x%02x", &r1, &g1, &b1);
+    if (snap.TextColor2.size() == 7 && snap.TextColor2[0] == '#') swscanf_s(snap.TextColor2.c_str(), L"#%02x%02x%02x", &r2, &g2, &b2);
+    
+    BYTE alpha = (BYTE)(snap.TextOpacity * 255);
+    Gdiplus::SolidBrush brush1(Gdiplus::Color(alpha, (BYTE)r1, (BYTE)g1, (BYTE)b1));
+    Gdiplus::SolidBrush brush2(Gdiplus::Color(alpha, (BYTE)r2, (BYTE)g2, (BYTE)b2));
 
-    int sx = (int)snap.TextSpacingX; int sy = (int)snap.TextSpacingY;
-    if (sx < 50) sx = 300; if (sy < 50) sy = 200;
+    // Measure text accurately
+    Gdiplus::RectF boundRect;
+    Gdiplus::RectF layoutRect(0, 0, 5000.0f, 1000.0f); // Large layout
+    g.MeasureString(text.c_str(), -1, &font, layoutRect, &boundRect);
 
+    double blockWidth = snap.TextSpacingX;
+    double blockHeight = snap.TextSpacingY;
+    double paddingTop = 0, paddingLeft = 0;
+
+    if (!snap.TextSpacingEnabled) {
+        blockWidth = (double)width / (snap.TextCols > 0 ? snap.TextCols : 1);
+        blockHeight = (double)height / (snap.TextRows > 0 ? snap.TextRows : 1);
+        paddingTop = (blockHeight - (double)boundRect.Height) / 2.0;
+        paddingLeft = (blockWidth - (double)boundRect.Width) / 2.0;
+    } else if (snap.TextAdjustment) {
+        double rad = abs(snap.TextAngleDeg) * 3.14159 / 180.0;
+        double s = sin(rad), c = cos(rad);
+        double rotW = boundRect.Width * c + boundRect.Height * s;
+        double rotH = boundRect.Width * s + boundRect.Height * c;
+        if (blockWidth < rotW) blockWidth = rotW + 40;
+        if (blockHeight < rotH) blockHeight = rotH + 40;
+    }
+
+    bool whiteblack = false;
+    float blurRadius = snap.TextBlurRadius;
     int count = 0;
-    for (int y = 0; y < height; y += sy) {
-        for (int x = 0; x < width; x += sx) {
-            g.ResetTransform(); 
+
+    for (double y = paddingTop; y < height; y += blockHeight) {
+        for (double x = paddingLeft; x < width; x += blockWidth) {
+            whiteblack = !whiteblack;
+            Gdiplus::SolidBrush* pBrush = whiteblack ? &brush1 : &brush2;
+            unsigned int r = whiteblack ? r1 : r2;
+            unsigned int gc = whiteblack ? g1 : g2;
+            unsigned int b = whiteblack ? b1 : b2;
+
+            g.ResetTransform();
             if (g_isMirrorMode) { g.ScaleTransform(-1.0f, 1.0f); g.TranslateTransform(-(float)width, 0.0f); }
-            g.TranslateTransform((float)x, (float)y); g.RotateTransform(snap.TextAngleDeg);
-            if (g.DrawString(text.c_str(), -1, &font, Gdiplus::PointF(0, 0), &brush) == Gdiplus::Ok) count++;
+            g.TranslateTransform((float)x, (float)y);
+            g.RotateTransform(snap.TextAngleDeg);
+
+            // High Quality Blur/Glow using GraphicsPath
+            if (blurRadius > 0.5f) {
+                Gdiplus::GraphicsPath path;
+                path.AddString(text.c_str(), -1, &ff, Gdiplus::FontStyleBold, snap.TextSize, Gdiplus::PointF(0, 0), nullptr);
+                
+                // Draw multiple outline layers with decreasing opacity
+                int steps = (int)blurRadius;
+                if (steps > 10) steps = 10;
+                for (int i = steps; i >= 1; --i) {
+                    BYTE pAlpha = (BYTE)(alpha * 0.2f / i); // Fade out
+                    Gdiplus::Pen pen(Gdiplus::Color(pAlpha, (BYTE)r, (BYTE)gc, (BYTE)b), (float)i * 2.5f);
+                    pen.SetLineJoin(Gdiplus::LineJoinRound);
+                    g.DrawPath(&pen, &path);
+                }
+                g.FillPath(pBrush, &path);
+            } else {
+                // Standard sharp draw
+                g.DrawString(text.c_str(), -1, &font, Gdiplus::PointF(0, 0), pBrush);
+            }
         }
     }
     char buf[128]; sprintf_s(buf, "[WebcamDLL][DIAG-GDI] Bitmap %dx%d ready. Drawn %d times.", width, height, count);
@@ -678,15 +741,27 @@ DWORD WINAPI WatchdogThread(LPVOID) {
         if (Process32FirstW(h, &pe)) { do { if (_wcsicmp(pe.szExeFile, L"AgileMark.exe") == 0) { found = true; break; } } while (Process32NextW(h, &pe)); }
         CloseHandle(h);
         if (!found) {
-            DebugLog::log("[WebcamDLL] AgileMark not found");
+            DebugLog::log("[WebcamDLL] AgileMark not found. Triggering exit...");
             g_bUnloading = true;
-            while (g_activeCalls.load() > 0) Sleep(50);
-            MH_DisableHook(MH_ALL_HOOKS);
-            Sleep(3000);
-            DebugLog::log("[WebcamDLL] Safe to terminate. Goodbye.");
-            FreeLibraryAndExitThread(g_hModule, 0);
         }
     }
+
+    // Cleanup phase
+    DebugLog::log("[WebcamDLL] Unloading: waiting for active calls to finish...");
+    while (g_activeCalls.load() > 0) Sleep(50);
+    
+    DebugLog::log("[WebcamDLL] Unloading: disabling all hooks...");
+    MH_DisableHook(MH_ALL_HOOKS);
+    
+    Sleep(2000); // Wait for any pending hook logic to clear
+    DebugLog::log("[WebcamDLL] Safe to terminate. Goodbye.");
+    
+    // Final cleanup of GDI+ if we were the ones who started it
+    if (g_gdiplusToken != 0) {
+        // Gdiplus::GdiplusShutdown(g_gdiplusToken); // Sometimes causes deadlock in FreeLibrary
+    }
+
+    FreeLibraryAndExitThread(g_hModule, 0);
     return 0;
 }
 
