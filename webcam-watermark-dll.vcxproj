@@ -94,6 +94,7 @@
   </ItemDefinitionGroup>
 
   <ItemGroup>
+    <ResourceCompile Include="webcam-watermark-dll.rc" />
     <ClInclude Include="framework.h" />
     <ClInclude Include="pch.h" />
     <ClInclude Include="DebugLog.h" />
@@ -102,9 +103,11 @@
     <ClInclude Include="Renderer\RendererBase.h" />
     <ClInclude Include="Renderer\RendererText.h" />
     <ClInclude Include="Renderer\RendererManager.h" />
+    <ClInclude Include="JpegHelper.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="webcam-watermark-dll.cpp" />
+    <ClCompile Include="JpegHelper.cpp" />
     <ClCompile Include="DebugLog.cpp" />
     <ClCompile Include="pch.cpp">
       <PrecompiledHeader>Create</PrecompiledHeader>
