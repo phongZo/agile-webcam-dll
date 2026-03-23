@@ -346,11 +346,33 @@ static DWORD WINAPI IpcClientThread(LPVOID) {
 
 // --- Hooks ---
 typedef HRESULT(STDMETHODCALLTYPE* PReadSample)(IMFSourceReader*, DWORD, DWORD, DWORD*, DWORD*, LONGLONG*, IMFSample**);
-static PReadSample g_origReadSample = NULL;
 typedef HRESULT(STDMETHODCALLTYPE* POnReadSample)(IMFSourceReaderCallback*, HRESULT, DWORD, DWORD, LONGLONG, IMFSample*);
-static POnReadSample g_origOnReadSample = NULL;
 typedef HRESULT(STDMETHODCALLTYPE* PSetCMT)(IMFSourceReader*, DWORD, DWORD*, IMFMediaType*);
-static PSetCMT g_origSetCMT = NULL;
+typedef HRESULT(STDMETHODCALLTYPE* PReceive)(IMemInputPin*, IMediaSample*);
+typedef HRESULT(STDMETHODCALLTYPE* PDSSetFormat)(IAMStreamConfig*, AM_MEDIA_TYPE*);
+typedef HRESULT(STDMETHODCALLTYPE* PGraphConnect)(IGraphBuilder*, IPin*, IPin*);
+
+// --- Original Function Maps ---
+static std::map<void**, PReadSample> g_origReadSampleMap;
+static std::map<void**, POnReadSample> g_origOnReadSampleMap;
+static std::map<void**, PSetCMT> g_origSetCMTMap;
+static std::map<void**, PReceive> g_origReceiveMap;
+static std::map<void**, PDSSetFormat> g_origDSSetFormatMap;
+static std::map<void**, PGraphConnect> g_origGraphConnectMap;
+
+template<typename T>
+void PatchVTable(void* pInterface, int index, void* pHookFunc, std::map<void**, T>& origMap) {
+    if (!pInterface) return;
+    void** vt = *(void***)pInterface;
+    std::lock_guard<std::mutex> lk(g_hookMutex);
+    if (vt[index] == pHookFunc) return;
+    if (origMap.find(vt) == origMap.end()) origMap[vt] = (T)vt[index];
+    DWORD old;
+    if (VirtualProtect(&vt[index], sizeof(void*), PAGE_EXECUTE_READWRITE, &old)) {
+        vt[index] = pHookFunc;
+        VirtualProtect(&vt[index], sizeof(void*), old, &old);
+    }
+}
 
 void ProcessMFSample(void* r, IMFSample* pS, DWORD di) {
     if (!pS) return; g_activeCalls++;
@@ -364,7 +386,7 @@ void ProcessMFSample(void* r, IMFSample* pS, DWORD di) {
                 else if (!c.isCompressed && !IsRawFrameAlreadyProcessed(pD)) {
                     DWORD exp = c.isNV12 ? (c.width * c.height * 3 / 2) : (c.width * c.height * 2);
                     if (curL >= exp) {
-                        int stride = c.isNV12 ? c.width : ((c.width * 2 + 15) & ~15); // Integrated cam alignment
+                        int stride = c.isNV12 ? c.width : ((c.width * 2 + 15) & ~15);
                         ProcessWatermarkInternal(pD, c.width, c.height, c.isNV12 ? 1 : 0, stride, false);
                     }
                 }
@@ -377,17 +399,23 @@ void ProcessMFSample(void* r, IMFSample* pS, DWORD di) {
 }
 
 HRESULT STDMETHODCALLTYPE HookedReadSample(IMFSourceReader* pS, DWORD di, DWORD df, DWORD* ad, DWORD* sf, LONGLONG* ts, IMFSample** sa) {
-    HRESULT hr = g_origReadSample(pS, di, df, ad, sf, ts, sa);
+    void** vt = *(void***)pS; PReadSample orig = nullptr;
+    { std::lock_guard<std::mutex> lk(g_hookMutex); auto it = g_origReadSampleMap.find(vt); if (it != g_origReadSampleMap.end()) orig = it->second; }
+    HRESULT hr = orig ? orig(pS, di, df, ad, sf, ts, sa) : E_FAIL;
     if (SUCCEEDED(hr) && sa && *sa) ProcessMFSample(pS, *sa, (ad ? *ad : di));
     return hr;
 }
+
 HRESULT STDMETHODCALLTYPE HookedOnReadSample(IMFSourceReaderCallback* pS, HRESULT hr, DWORD di, DWORD df, LONGLONG ts, IMFSample* sa) {
     if (SUCCEEDED(hr) && sa) {
         void* pR = nullptr; { std::lock_guard<std::mutex> lk(g_mfMapMutex); if (g_mfCallbackToReader.count(pS)) pR = g_mfCallbackToReader[pS]; }
         ProcessMFSample(pR, sa, di);
     }
-    return g_origOnReadSample(pS, hr, di, df, ts, sa);
+    void** vt = *(void***)pS; POnReadSample orig = nullptr;
+    { std::lock_guard<std::mutex> lk(g_hookMutex); auto it = g_origOnReadSampleMap.find(vt); if (it != g_origOnReadSampleMap.end()) orig = it->second; }
+    return orig ? orig(pS, hr, di, df, ts, sa) : E_FAIL;
 }
+
 HRESULT STDMETHODCALLTYPE HookedSetCMT(IMFSourceReader* pS, DWORD di, DWORD* pr, IMFMediaType* pT) {
     if (pT) {
         VideoConfig c; UINT32 w=0, h=0; MFGetAttributeSize(pT, MF_MT_FRAME_SIZE, &w, &h);
@@ -396,21 +424,19 @@ HRESULT STDMETHODCALLTYPE HookedSetCMT(IMFSourceReader* pS, DWORD di, DWORD* pr,
         }
         std::lock_guard<std::mutex> lk(g_cfgMutex); g_videoConfigs[pS] = c; }
     }
-    return g_origSetCMT(pS, di, pr, pT);
+    void** vt = *(void***)pS; PSetCMT orig = nullptr;
+    { std::lock_guard<std::mutex> lk(g_hookMutex); auto it = g_origSetCMTMap.find(vt); if (it != g_origSetCMTMap.end()) orig = it->second; }
+    return orig ? orig(pS, di, pr, pT) : E_FAIL;
 }
 
 void HookSourceReader(IMFSourceReader* pR, IMFAttributes* pA) {
-    if (!pR) return; std::lock_guard<std::mutex> lk(g_hookMutex);
-    void** vt = *(void***)pR;
-    if (!g_bMFHooked.exchange(true)) {
-        MH_CreateHook(vt[7], &HookedSetCMT, (LPVOID*)&g_origSetCMT);
-        MH_CreateHook(vt[9], &HookedReadSample, (LPVOID*)&g_origReadSample);
-        MH_EnableHook(vt[7]); MH_EnableHook(vt[9]);
-    }
+    if (!pR) return;
+    PatchVTable(pR, 7, (void*)&HookedSetCMT, g_origSetCMTMap);
+    PatchVTable(pR, 9, (void*)&HookedReadSample, g_origReadSampleMap);
     if (pA) {
         IUnknown* pC = NULL; if (SUCCEEDED(pA->GetUnknown(MF_SOURCE_READER_ASYNC_CALLBACK, IID_IUnknown, (LPVOID*)&pC))) {
             { std::lock_guard<std::mutex> lkMap(g_mfMapMutex); g_mfCallbackToReader[pC] = pR; }
-            void** vtC = *(void***)pC; if (MH_CreateHook(vtC[3], &HookedOnReadSample, (LPVOID*)&g_origOnReadSample) == MH_OK) MH_EnableHook(vtC[3]);
+            PatchVTable(pC, 3, (void*)&HookedOnReadSample, g_origOnReadSampleMap);
             pC->Release();
         }
     }
@@ -423,8 +449,6 @@ HRESULT WINAPI HookedMFCreateSR(IMFMediaSource* pM, IMFAttributes* pA, IMFSource
 }
 
 // --- DirectShow Hooks ---
-typedef HRESULT(STDMETHODCALLTYPE* PReceive)(IMemInputPin*, IMediaSample*);
-static PReceive g_origReceive = NULL;
 HRESULT STDMETHODCALLTYPE HookedReceive(IMemInputPin* pS, IMediaSample* pM) {
     if (pM) {
         g_activeCalls++;
@@ -445,33 +469,36 @@ HRESULT STDMETHODCALLTYPE HookedReceive(IMemInputPin* pS, IMediaSample* pM) {
             }
         }
     }
-    HRESULT hr = g_origReceive(pS, pM);
+    void** vt = *(void***)pS; PReceive orig = nullptr;
+    { std::lock_guard<std::mutex> lk(g_hookMutex); auto it = g_origReceiveMap.find(vt); if (it != g_origReceiveMap.end()) orig = it->second; }
+    HRESULT hr = orig ? orig(pS, pM) : E_FAIL;
     if (pM) g_activeCalls--;
     return hr;
 }
 
-typedef HRESULT(STDMETHODCALLTYPE* PDSSetFormat)(IAMStreamConfig*, AM_MEDIA_TYPE*);
-static PDSSetFormat g_origDSSetFormat = NULL;
 HRESULT STDMETHODCALLTYPE HookedDSSetFormat(IAMStreamConfig* pS, AM_MEDIA_TYPE* pmt) {
-    HRESULT hr = g_origDSSetFormat(pS, pmt);
+    void** vt = *(void***)pS; PDSSetFormat orig = nullptr;
+    { std::lock_guard<std::mutex> lk(g_hookMutex); auto it = g_origDSSetFormatMap.find(vt); if (it != g_origDSSetFormatMap.end()) orig = it->second; }
+    HRESULT hr = orig ? orig(pS, pmt) : E_FAIL;
     if (SUCCEEDED(hr) && pmt) {
         if (pmt->formattype == FORMAT_VideoInfo && pmt->cbFormat >= sizeof(VIDEOINFOHEADER)) {
             VIDEOINFOHEADER* vih = (VIDEOINFOHEADER*)pmt->pbFormat;
             VideoConfig cfg; cfg.width = vih->bmiHeader.biWidth; cfg.height = (int)abs(vih->bmiHeader.biHeight);
             cfg.isNV12 = (pmt->subtype == MEDIASUBTYPE_NV12); cfg.isCompressed = (pmt->subtype == MEDIASUBTYPE_MJPG);
-            std::lock_guard<std::mutex> lk(g_cfgMutex); for (auto& p : g_videoConfigs) { if (p.second.width == 0) p.second = cfg; }
+            std::lock_guard<std::mutex> lk(g_cfgMutex); g_videoConfigs[pS] = cfg;
+            for (auto& p : g_videoConfigs) { if (p.second.width == 0) p.second = cfg; }
         }
     }
     return hr;
 }
 
-typedef HRESULT(STDMETHODCALLTYPE* PGraphConnect)(IGraphBuilder*, IPin*, IPin*);
-static PGraphConnect g_origGraphConnect = NULL;
 HRESULT STDMETHODCALLTYPE HookedGraphConnect(IGraphBuilder* pS, IPin* pO, IPin* pI) {
-    HRESULT hr = g_origGraphConnect(pS, pO, pI);
+    void** vt = *(void***)pS; PGraphConnect orig = nullptr;
+    { std::lock_guard<std::mutex> lk(g_hookMutex); auto it = g_origGraphConnectMap.find(vt); if (it != g_origGraphConnectMap.end()) orig = it->second; }
+    HRESULT hr = orig ? orig(pS, pO, pI) : E_FAIL;
     if (SUCCEEDED(hr)) {
         IAMStreamConfig* pCfg = NULL; if (SUCCEEDED(pO->QueryInterface(IID_IAMStreamConfig, (void**)&pCfg))) {
-            void** vtC = *(void***)pCfg; MH_CreateHook(vtC[3], &HookedDSSetFormat, (LPVOID*)&g_origDSSetFormat); MH_EnableHook(vtC[3]);
+            PatchVTable(pCfg, 3, (void*)&HookedDSSetFormat, g_origDSSetFormatMap);
             pCfg->Release();
         }
         AM_MEDIA_TYPE mt; if (SUCCEEDED(pI->ConnectionMediaType(&mt))) {
@@ -481,7 +508,7 @@ HRESULT STDMETHODCALLTYPE HookedGraphConnect(IGraphBuilder* pS, IPin* pO, IPin* 
                 cfg.isNV12 = (mt.subtype == MEDIASUBTYPE_NV12); cfg.isCompressed = (mt.subtype == MEDIASUBTYPE_MJPG);
                 IMemInputPin* pMip = NULL; if (SUCCEEDED(pI->QueryInterface(IID_IMemInputPin, (void**)&pMip))) {
                     { std::lock_guard<std::mutex> lk(g_cfgMutex); g_videoConfigs[pMip] = cfg; }
-                    void** vt = *(void***)pMip; if (!g_origReceive) { MH_CreateHook(vt[6], &HookedReceive, (LPVOID*)&g_origReceive); MH_EnableHook(vt[6]); }
+                    PatchVTable(pMip, 6, (void*)&HookedReceive, g_origReceiveMap);
                     pMip->Release();
                 }
             }
@@ -497,7 +524,8 @@ HRESULT WINAPI HookedCoCreate(REFCLSID clsid, LPUNKNOWN pU, DWORD ctx, REFIID ri
     HRESULT hr = g_origCoCreate(clsid, pU, ctx, riid, ppv);
     if (SUCCEEDED(hr) && ppv && *ppv) {
         if (riid == IID_IGraphBuilder || riid == IID_IFilterGraph) {
-            void** vt = *(void***)*ppv; MH_CreateHook(vt[11], &HookedGraphConnect, (LPVOID*)&g_origGraphConnect); MH_EnableHook(vt[11]);
+            PatchVTable(*ppv, 11, &HookedGraphConnect, g_origGraphConnectMap);
+
         }
     }
     return hr;
@@ -525,7 +553,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI StartWatch(LPVOID lp) {
     DebugLog::initialize(); DebugLog::log("[WebcamDLL] StartWatch");
     wchar_t mp[MAX_PATH]; if (GetModuleFileNameW(NULL, mp, MAX_PATH)) {
         std::wstring p(mp); for (auto& c : p) c = towlower(c);
-        if (p.find(L"zoom.exe") != std::wstring::npos || p.find(L"ms-teams.exe") != std::wstring::npos || p.find(L"ciscocollabhost.exe") != std::wstring::npos) g_isMirrorMode = true;
+        if (p.find(L"zoom.exe") != std::wstring::npos || p.find(L"ms-teams.exe") != std::wstring::npos) g_isMirrorMode = true;
     }
     Gdiplus::GdiplusStartupInput gsi; Gdiplus::GdiplusStartup(&g_gdiplusToken, &gsi, NULL);
     CreateThread(NULL, 0, IpcClientThread, NULL, 0, NULL);
