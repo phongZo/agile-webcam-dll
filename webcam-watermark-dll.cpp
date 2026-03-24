@@ -17,8 +17,6 @@
 #include "DebugLog.h"
 #include "../packages/minhook.1.3.3/lib/native/include/MinHook.h"
 #include <nlohmann/json.hpp>
-#include "Renderer/RendererManager.h"
-#include "Renderer/RenderSnapshot.h"
 #include "JpegHelper.h"
 
 #pragma comment(lib, "strmiids.lib")
@@ -60,8 +58,24 @@ static std::mutex g_drawMutex;
 static ULONG_PTR g_gdiplusToken = 0;
 static bool g_isMirrorMode = false;
 
-static std::atomic<bool> g_bDShowHooked(false);
-static std::atomic<bool> g_bMFHooked(false);
+static void CheckProcessAndSetMirrorMode() {
+    wchar_t path[MAX_PATH];
+    if (GetModuleFileNameW(NULL, path, MAX_PATH)) {
+        std::wstring wsPath(path);
+        std::transform(wsPath.begin(), wsPath.end(), wsPath.begin(), ::towlower);
+
+        // Mirror for Zoom and Teams (both old and new versions)
+        if (wsPath.find(L"zoom.exe") != std::wstring::npos ||
+            wsPath.find(L"teams.exe") != std::wstring::npos) {
+            g_isMirrorMode = true;
+            DebugLog::log("[WebcamDLL] Mirror Mode ENABLED for target process.");
+        }
+        else {
+            g_isMirrorMode = false;
+            DebugLog::log("[WebcamDLL] Mirror Mode DISABLED for target process.");
+        }
+    }
+}
 
 struct BufferTag { DWORD timestamp; };
 static std::map<void*, BufferTag> g_processedRawBuffers;
@@ -74,22 +88,22 @@ struct VideoConfig {
 static std::map<void*, VideoConfig> g_videoConfigs;
 static std::mutex g_cfgMutex;
 
-struct ResKey {
-    int w, h; uint32_t sig; std::wstring text;
-    bool operator<(const ResKey& o) const { 
-        if(w != o.w) return w < o.w; if(h != o.h) return h < o.h; 
-        if(sig != o.sig) return sig < o.sig; return text < o.text; 
-    }
-};
-static std::map<ResKey, Gdiplus::Bitmap*> g_resBmpCache;
-static std::mutex g_cacheMutex;
-
 static std::map<void*, void*> g_mfCallbackToReader;
 static std::mutex g_mfMapMutex;
 
-static const wchar_t* kPipeInject = L"\\\\.\\pipe\\AgileMarkPipe_qaKOab5VPyK4ar4A6sfm2VZ0";
+// --- Shared Memory for Pre-rendered Bitmap ---
+static HANDLE g_hWatermarkMap = NULL;
+static BYTE* g_pWatermarkBuffer = NULL;
+static int g_watermarkW = 0, g_watermarkH = 0;
+static std::mutex g_sharedMemMutex;
 
-// --- Advanced String Helpers ---
+static void CleanupSharedWatermark() {
+    std::lock_guard<std::mutex> lock(g_sharedMemMutex);
+    if (g_pWatermarkBuffer) { UnmapViewOfFile(g_pWatermarkBuffer); g_pWatermarkBuffer = NULL; }
+    if (g_hWatermarkMap) { CloseHandle(g_hWatermarkMap); g_hWatermarkMap = NULL; }
+    g_watermarkW = 0; g_watermarkH = 0;
+}
+
 static std::wstring Utf8ToUtf16(const std::string& s) {
     if (s.empty()) return L"";
     int len = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
@@ -97,52 +111,32 @@ static std::wstring Utf8ToUtf16(const std::string& s) {
     return ws;
 }
 
-static void ReplaceAllCI(std::wstring& text, const std::wstring& search, const std::wstring& replace) {
-    if (search.empty() || text.empty()) return;
-    std::wstring sl = search; std::transform(sl.begin(), sl.end(), sl.begin(), ::towlower);
-    size_t pos = 0;
-    while (true) {
-        std::wstring tl = text; std::transform(tl.begin(), tl.end(), tl.begin(), ::towlower);
-        pos = tl.find(sl, pos);
-        if (pos == std::wstring::npos) break;
-        text.replace(pos, search.length(), replace);
-        pos += replace.length();
+static void UpdateSharedWatermarkBuffer(const std::wstring& name, int w, int h) {
+    if (name.empty() || w <= 0 || h <= 0) { 
+        CleanupSharedWatermark(); 
+        return; 
+    }
+    
+    std::lock_guard<std::mutex> lock(g_sharedMemMutex);
+    if (g_hWatermarkMap != NULL && g_watermarkW == w && g_watermarkH == h) return;
+
+    if (g_pWatermarkBuffer) { UnmapViewOfFile(g_pWatermarkBuffer); g_pWatermarkBuffer = NULL; }
+    if (g_hWatermarkMap) { CloseHandle(g_hWatermarkMap); g_hWatermarkMap = NULL; }
+
+    g_hWatermarkMap = OpenFileMappingW(FILE_MAP_READ, FALSE, name.c_str());
+    if (g_hWatermarkMap) {
+        g_pWatermarkBuffer = (BYTE*)MapViewOfFile(g_hWatermarkMap, FILE_MAP_READ, 0, 0, 0);
+        if (g_pWatermarkBuffer) {
+            g_watermarkW = w;
+            g_watermarkH = h;
+            DebugLog::log("[WebcamDLL] Shared Watermark Buffer updated: " + std::to_string(w) + "x" + std::to_string(h));
+        } else {
+            CloseHandle(g_hWatermarkMap); g_hWatermarkMap = NULL;
+        }
     }
 }
 
-static std::wstring ExpandMacros(std::wstring text) {
-    wchar_t comp[MAX_COMPUTERNAME_LENGTH + 1] = {0}; DWORD sz = ARRAYSIZE(comp);
-    if (GetComputerNameW(comp, &sz)) { ReplaceAllCI(text, L"{MachineName}", comp); ReplaceAllCI(text, L"{machinename}", comp); }
-    wchar_t user[256] = {0}; DWORD usz = ARRAYSIZE(user);
-    if (GetUserNameW(user, &usz)) { ReplaceAllCI(text, L"{UserName}", user); ReplaceAllCI(text, L"{username}", user); }
-    SYSTEMTIME st; GetLocalTime(&st);
-    wchar_t sd[32], stm[32]; swprintf_s(sd, L"%02d/%02d/%04d", st.wDay, st.wMonth, st.wYear); swprintf_s(stm, L"%02d:%02d", st.wHour, st.wMinute);
-    ReplaceAllCI(text, L"{ShortDate}", sd); ReplaceAllCI(text, L"{shortdate}", sd);
-    ReplaceAllCI(text, L"{ShortTime}", stm); ReplaceAllCI(text, L"{shorttime}", stm);
-    return text;
-}
-
-static bool TryParseSnapshotFromJson(const json& j, RenderSnapshot& outSnap) {
-    if (!j.contains("MarkerJson") || !j["MarkerJson"].is_string()) return false;
-    try {
-        auto m = json::parse(j["MarkerJson"].get<std::string>());
-        outSnap.TextEnabled = m.value("TextEnabled", true);
-        outSnap.TextFormat = Utf8ToUtf16(m.value("TextFormat", "{machinename} | {username}"));
-        outSnap.TextSize = (float)m.value("TextSize", 28);
-        outSnap.TextOpacity = m.value("TextOpacity", 0.5f);
-        outSnap.TextAngleDeg = (float)m.value("TextAngle", -20.0f);
-        outSnap.TextSpacingEnabled = m.value("TextSpacingEnabled", true);
-        outSnap.TextSpacingX = (float)m.value("TextSpacingX", 300.0f);
-        outSnap.TextSpacingY = (float)m.value("TextSpacingY", 150.0f);
-        outSnap.TextCols = m.value("TextCols", 4);
-        outSnap.TextRows = m.value("TextRows", 3);
-        outSnap.TextColor1 = Utf8ToUtf16(m.value("TextColor1", "#000000"));
-        outSnap.TextColor2 = Utf8ToUtf16(m.value("TextColor2", "#FFFFFF"));
-        outSnap.Opacity = m.value("Opacity", 1.0f);
-        outSnap.DrawingEnabled = m.value("DrawingEnabled", true);
-        return true;
-    } catch (...) { return false; }
-}
+static const wchar_t* kPipeInject = L"\\\\.\\pipe\\AgileMarkPipe_qaKOab5VPyK4ar4A6sfm2VZ0";
 
 // --- Anti-Double Exposure ---
 bool IsRawFrameAlreadyProcessed(void* pData) {
@@ -163,7 +157,8 @@ void BlendARGBtoYUY2(BYTE* pData, int width, int height, int stride, Gdiplus::Bi
         int dW = (std::min)(width, (int)pBmp->GetWidth()), dH = (std::min)(height, (int)pBmp->GetHeight());
         for (int y = 0; y < dH; y++) {
             for (int x = 0; x < dW; x++) {
-                BYTE* pS = pSrc + (y * bd.Stride) + (x * 4);
+                int srcX = g_isMirrorMode ? (dW - 1 - x) : x;
+                BYTE* pS = pSrc + (y * bd.Stride) + (srcX * 4);
                 int alpha = pS[3];
                 if (alpha > 30) {
                     int invA = 255 - alpha;
@@ -173,8 +168,8 @@ void BlendARGBtoYUY2(BYTE* pData, int width, int height, int stride, Gdiplus::Bi
                     BYTE U = (BYTE)(-(0.1687 * pS[2]) - (0.3313 * pS[1]) + (0.5 * pS[0]) + 128);
                     BYTE V = (BYTE)((0.5 * pS[2]) - (0.4187 * pS[1]) - (0.0813 * pS[0]) + 128);
                     pData[yP] = (BYTE)((Y * alpha + pData[yP] * invA) >> 8);
-                    pData[base+1] = (BYTE)((U * alpha + pData[base+1] * invA) >> 8);
-                    pData[base+3] = (BYTE)((V * alpha + pData[base+3] * invA) >> 8);
+                    pData[base + 1] = (BYTE)((U * alpha + pData[base + 1] * invA) >> 8);
+                    pData[base + 3] = (BYTE)((V * alpha + pData[base + 3] * invA) >> 8);
                 }
             }
         }
@@ -189,7 +184,8 @@ void BlendARGBtoNV12(BYTE* pY, BYTE* pUV, int width, int height, int stride, Gdi
         int dW = (std::min)(width, (int)pBmp->GetWidth()), dH = (std::min)(height, (int)pBmp->GetHeight());
         for (int y = 0; y < dH; y++) {
             for (int x = 0; x < dW; x++) {
-                BYTE* pS = pSrc + (y * bd.Stride) + (x * 4);
+                int srcX = g_isMirrorMode ? (dW - 1 - x) : x;
+                BYTE* pS = pSrc + (y * bd.Stride) + (srcX * 4);
                 int alpha = pS[3];
                 if (alpha > 30) {
                     int invA = 255 - alpha; int yPos = y * stride + x;
@@ -199,7 +195,7 @@ void BlendARGBtoNV12(BYTE* pY, BYTE* pUV, int width, int height, int stride, Gdi
                     BYTE V = (BYTE)((0.5 * pS[2]) - (0.4187 * pS[1]) - (0.0813 * pS[0]) + 128);
                     pY[yPos] = (BYTE)((Y * alpha + pY[yPos] * invA) >> 8);
                     pUV[uvIdx] = (BYTE)((U * alpha + pUV[uvIdx] * invA) >> 8);
-                    pUV[uvIdx+1] = (BYTE)((V * alpha + pUV[uvIdx+1] * invA) >> 8);
+                    pUV[uvIdx + 1] = (BYTE)((V * alpha + pUV[uvIdx + 1] * invA) >> 8);
                 }
             }
         }
@@ -215,7 +211,8 @@ void BlendARGBtoBGRA(BYTE* pData, int width, int height, int stride, Gdiplus::Bi
         int bpp = stride / width;
         for (int y = 0; y < dH; y++) {
             for (int x = 0; x < dW; x++) {
-                BYTE* pS = pSrc + (y * bd.Stride) + (x * 4);
+                int srcX = g_isMirrorMode ? (dW - 1 - x) : x;
+                BYTE* pS = pSrc + (y * bd.Stride) + (srcX * 4);
                 int alpha = pS[3];
                 if (alpha > 30) {
                     BYTE* pD = pData + (y * stride) + (x * bpp);
@@ -231,66 +228,22 @@ void BlendARGBtoBGRA(BYTE* pData, int width, int height, int stride, Gdiplus::Bi
     }
 }
 
-Gdiplus::Bitmap* GetWatermarkForRes(const RenderSnapshot& snap, int width, int height) {
-    std::lock_guard<std::mutex> lock(g_cacheMutex);
-    std::wstring expanded = ExpandMacros(snap.TextFormat);
-    ResKey key = { width, height, (uint32_t)snap.Signature(), expanded };
-    if (g_resBmpCache.count(key)) return g_resBmpCache[key];
-
-    for (auto it = g_resBmpCache.begin(); it != g_resBmpCache.end(); ) {
-        if (it->first.w == width && it->first.h == height) { delete it->second; it = g_resBmpCache.erase(it); } else ++it;
-    }
-
-    Gdiplus::Bitmap* pBmp = new Gdiplus::Bitmap(width, height, PixelFormat32bppARGB);
-    Gdiplus::Graphics g(pBmp);
-    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-    g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAlias);
-    g.Clear(Gdiplus::Color(0, 0, 0, 0));
-
-    Gdiplus::FontFamily ff(L"Arial");
-    Gdiplus::Font font(&ff, snap.TextSize, Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
-    unsigned int r1=0,g1=0,b1=0,r2=255,g2=255,b2=255;
-    swscanf_s(snap.TextColor1.c_str(), L"#%02x%02x%02x", &r1, &g1, &b1);
-    swscanf_s(snap.TextColor2.c_str(), L"#%02x%02x%02x", &r2, &g2, &b2);
-    BYTE alpha = (BYTE)(snap.TextOpacity * 255);
-    Gdiplus::SolidBrush b1s(Gdiplus::Color(alpha, (BYTE)r1, (BYTE)g1, (BYTE)b1));
-    Gdiplus::SolidBrush b2s(Gdiplus::Color(alpha, (BYTE)r2, (BYTE)g2, (BYTE)b2));
-
-    double bW, bH, pT = 0, pL = 0;
-    if (!snap.TextSpacingEnabled) {
-        bW = (double)width / (snap.TextCols > 0 ? snap.TextCols : 1);
-        bH = (double)height / (snap.TextRows > 0 ? snap.TextRows : 1);
-        Gdiplus::RectF br; g.MeasureString(expanded.c_str(), -1, &font, Gdiplus::PointF(0, 0), &br);
-        pT = (bH - br.Height) / 2.0; pL = (bW - br.Width) / 2.0;
-    } else {
-        bW = (std::max)(150.0f, snap.TextSpacingX); bH = (std::max)(100.0f, snap.TextSpacingY);
-    }
-
-    bool wb = false;
-    for (double y = pT; y < height; y += bH) {
-        for (double x = pL; x < width; x += bW) {
-            wb = !wb; g.ResetTransform();
-            if (g_isMirrorMode) { g.ScaleTransform(-1.0f, 1.0f); g.TranslateTransform(-(float)width, 0.0f); }
-            g.TranslateTransform((float)x, (float)y); g.RotateTransform(snap.TextAngleDeg);
-            g.DrawString(expanded.c_str(), -1, &font, Gdiplus::PointF(0, 0), wb ? &b1s : &b2s);
-        }
-    }
-    g_resBmpCache[key] = pBmp;
-    return pBmp;
-}
-
 static void ProcessWatermarkInternal(BYTE* pData, int width, int height, int formatType, int stride, bool isCompressed) {
     if (g_bUnloading.load() || isCompressed || !pData || width <= 0 || height <= 0) return;
     std::lock_guard<std::mutex> lock(g_drawMutex);
     if (g_gdiplusToken == 0) return;
-    if (RendererManager::Instance().HasSnapshot()) {
-        const auto& snap = RendererManager::Instance().GetSnapshot();
-        if (!snap.TextEnabled) return;
-        Gdiplus::Bitmap* pBmp = GetWatermarkForRes(snap, width, height);
+
+    std::lock_guard<std::mutex> shmLock(g_sharedMemMutex);
+    if (g_pWatermarkBuffer && g_watermarkW > 0 && g_watermarkH > 0) {
+        // Create wrapper bitmap from shared memory (no pixel data copy)
+        Gdiplus::Bitmap* pBmp = new Gdiplus::Bitmap(g_watermarkW, g_watermarkH, g_watermarkW * 4, PixelFormat32bppARGB, g_pWatermarkBuffer);
+        
         if (pBmp) {
             if (formatType == 1) BlendARGBtoNV12(pData, pData + (stride * height), width, height, stride, pBmp);
             else if (formatType == 0) BlendARGBtoYUY2(pData, width, height, stride, pBmp);
             else if (formatType == 2) BlendARGBtoBGRA(pData, width, height, stride, pBmp);
+            
+            delete pBmp; // Delete wrapper object only, raw buffer in SHM remains
         }
     }
 }
@@ -323,9 +276,12 @@ static void ProcessPipeLineBuffer(std::string& buffer) {
         std::string line = buffer.substr(0, pos); buffer.erase(0, pos + 1);
         try {
             auto j = json::parse(line);
-            if (j.value("CMD", "") == "UnloadDLL") { DebugLog::log("[WebcamDLL][IPC] UnloadDLL requested."); g_bUnloading = true; }
-            else if (j.value("CMD", "") == "UpdateMarkerDLL") {
-                RenderSnapshot snap; if (TryParseSnapshotFromJson(j, snap)) RendererManager::Instance().SetSnapshot(snap);
+            std::string cmd = j.value("CMD", "");
+            if (cmd == "UpdateBitmapShared") {
+                std::string shmName = j.value("SharedMemoryName", "");
+                int w = j.value("Width", 0);
+                int h = j.value("Height", 0);
+                UpdateSharedWatermarkBuffer(Utf8ToUtf16(shmName), w, h);
             }
         } catch (...) {}
     }
@@ -352,7 +308,6 @@ typedef HRESULT(STDMETHODCALLTYPE* PReceive)(IMemInputPin*, IMediaSample*);
 typedef HRESULT(STDMETHODCALLTYPE* PDSSetFormat)(IAMStreamConfig*, AM_MEDIA_TYPE*);
 typedef HRESULT(STDMETHODCALLTYPE* PGraphConnect)(IGraphBuilder*, IPin*, IPin*);
 
-// --- Original Function Maps ---
 static std::map<void**, PReadSample> g_origReadSampleMap;
 static std::map<void**, POnReadSample> g_origOnReadSampleMap;
 static std::map<void**, PSetCMT> g_origSetCMTMap;
@@ -371,6 +326,47 @@ void PatchVTable(void* pInterface, int index, void* pHookFunc, std::map<void**, 
     if (VirtualProtect(&vt[index], sizeof(void*), PAGE_EXECUTE_READWRITE, &old)) {
         vt[index] = pHookFunc;
         VirtualProtect(&vt[index], sizeof(void*), old, &old);
+    }
+}
+
+static void RestoreAllVTableHooks() {
+    std::lock_guard<std::mutex> lk(g_hookMutex);
+    
+    for (auto it = g_origReadSampleMap.begin(); it != g_origReadSampleMap.end(); ++it) {
+        void** vt = it->first; PReadSample orig = it->second;
+        DWORD old; if (VirtualProtect(&vt[9], sizeof(void*), PAGE_EXECUTE_READWRITE, &old)) {
+            vt[9] = (void*)orig; VirtualProtect(&vt[9], sizeof(void*), old, &old);
+        }
+    }
+    for (auto it = g_origOnReadSampleMap.begin(); it != g_origOnReadSampleMap.end(); ++it) {
+        void** vt = it->first; POnReadSample orig = it->second;
+        DWORD old; if (VirtualProtect(&vt[3], sizeof(void*), PAGE_EXECUTE_READWRITE, &old)) {
+            vt[3] = (void*)orig; VirtualProtect(&vt[3], sizeof(void*), old, &old);
+        }
+    }
+    for (auto it = g_origSetCMTMap.begin(); it != g_origSetCMTMap.end(); ++it) {
+        void** vt = it->first; PSetCMT orig = it->second;
+        DWORD old; if (VirtualProtect(&vt[7], sizeof(void*), PAGE_EXECUTE_READWRITE, &old)) {
+            vt[7] = (void*)orig; VirtualProtect(&vt[7], sizeof(void*), old, &old);
+        }
+    }
+    for (auto it = g_origReceiveMap.begin(); it != g_origReceiveMap.end(); ++it) {
+        void** vt = it->first; PReceive orig = it->second;
+        DWORD old; if (VirtualProtect(&vt[6], sizeof(void*), PAGE_EXECUTE_READWRITE, &old)) {
+            vt[6] = (void*)orig; VirtualProtect(&vt[6], sizeof(void*), old, &old);
+        }
+    }
+    for (auto it = g_origDSSetFormatMap.begin(); it != g_origDSSetFormatMap.end(); ++it) {
+        void** vt = it->first; PDSSetFormat orig = it->second;
+        DWORD old; if (VirtualProtect(&vt[3], sizeof(void*), PAGE_EXECUTE_READWRITE, &old)) {
+            vt[3] = (void*)orig; VirtualProtect(&vt[3], sizeof(void*), old, &old);
+        }
+    }
+    for (auto it = g_origGraphConnectMap.begin(); it != g_origGraphConnectMap.end(); ++it) {
+        void** vt = it->first; PGraphConnect orig = it->second;
+        DWORD old; if (VirtualProtect(&vt[11], sizeof(void*), PAGE_EXECUTE_READWRITE, &old)) {
+            vt[11] = (void*)orig; VirtualProtect(&vt[11], sizeof(void*), old, &old);
+        }
     }
 }
 
@@ -525,7 +521,6 @@ HRESULT WINAPI HookedCoCreate(REFCLSID clsid, LPUNKNOWN pU, DWORD ctx, REFIID ri
     if (SUCCEEDED(hr) && ppv && *ppv) {
         if (riid == IID_IGraphBuilder || riid == IID_IFilterGraph) {
             PatchVTable(*ppv, 11, &HookedGraphConnect, g_origGraphConnectMap);
-
         }
     }
     return hr;
@@ -535,26 +530,27 @@ HRESULT WINAPI HookedCoCreate(REFCLSID clsid, LPUNKNOWN pU, DWORD ctx, REFIID ri
 DWORD WINAPI WatchdogThread(LPVOID) {
     while (!g_bUnloading.load()) {
         Sleep(3000); HANDLE h = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        PROCESSENTRY32W pe{sizeof(pe)}; bool f = false;
+        PROCESSENTRY32W pe{ sizeof(pe) }; bool f = false;
         if (Process32FirstW(h, &pe)) { do { if (_wcsicmp(pe.szExeFile, L"AgileMark.exe") == 0) { f = true; break; } } while (Process32NextW(h, &pe)); }
-        CloseHandle(h); if (!f) { DebugLog::log("[WebcamDLL] AgileMark not found. Unloading..."); g_bUnloading = true; }
+        CloseHandle(h); if (!f) { g_bUnloading = true; }
     }
-    DebugLog::log("[WebcamDLL] Waiting for threads...");
     while (g_activeCalls.load() > 0) Sleep(50);
-    MH_DisableHook(MH_ALL_HOOKS); Sleep(1000);
-    { std::lock_guard<std::mutex> lk(g_cacheMutex); for (auto& p : g_resBmpCache) delete p.second; g_resBmpCache.clear(); }
-    CoUninitialize(); DebugLog::log("[WebcamDLL] Safe to exit");
+    
+    // Safety First: Restore all VTable patches before unhooking MinHook
+    RestoreAllVTableHooks();
+    MH_DisableHook(MH_ALL_HOOKS); 
+    Sleep(500);
+
+    CleanupSharedWatermark();
+    if (g_gdiplusToken) { Gdiplus::GdiplusShutdown(g_gdiplusToken); g_gdiplusToken = 0; }
+    CoUninitialize();
     FreeLibraryAndExitThread(g_hModule, 0); return 0;
 }
 
 extern "C" __declspec(dllexport) DWORD WINAPI StartWatch(LPVOID lp) {
     if (g_bInitialized.exchange(true)) return 0;
+    CheckProcessAndSetMirrorMode();
     CoInitializeEx(NULL, COINIT_MULTITHREADED);
-    DebugLog::initialize(); DebugLog::log("[WebcamDLL] StartWatch");
-    wchar_t mp[MAX_PATH]; if (GetModuleFileNameW(NULL, mp, MAX_PATH)) {
-        std::wstring p(mp); for (auto& c : p) c = towlower(c);
-        if (p.find(L"zoom.exe") != std::wstring::npos || p.find(L"ms-teams.exe") != std::wstring::npos) g_isMirrorMode = true;
-    }
     Gdiplus::GdiplusStartupInput gsi; Gdiplus::GdiplusStartup(&g_gdiplusToken, &gsi, NULL);
     CreateThread(NULL, 0, IpcClientThread, NULL, 0, NULL);
     if (MH_Initialize() == MH_OK) {
