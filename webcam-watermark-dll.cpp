@@ -147,10 +147,14 @@ bool IsRawFrameAlreadyProcessed(void* pData) {
     return false;
 }
 
-// --- Blending ---
+// --- Blending & YUV BT.709 Limited Range Helpers ---
+// Y = 16 + 0.183R + 0.614G + 0.062B
+// U = 128 - 0.101R - 0.339G + 0.439B
+// V = 128 + 0.439R - 0.399G - 0.040B
+
 void BlendARGBtoYUY2(BYTE* pData, int width, int height, int stride, Gdiplus::Bitmap* pBmp) {
     Gdiplus::BitmapData bd; Gdiplus::Rect rc(0, 0, pBmp->GetWidth(), pBmp->GetHeight());
-    if (pBmp->LockBits(&rc, Gdiplus::ImageLockModeRead, PixelFormat32bppARGB, &bd) == Gdiplus::Ok) {
+    if (pBmp->LockBits(&rc, Gdiplus::ImageLockModeRead, PixelFormat32bppPARGB, &bd) == Gdiplus::Ok) {
         BYTE* pSrc = (BYTE*)bd.Scan0;
         int dW = (std::min)(width, (int)pBmp->GetWidth()), dH = (std::min)(height, (int)pBmp->GetHeight());
         for (int y = 0; y < dH; y++) {
@@ -162,12 +166,17 @@ void BlendARGBtoYUY2(BYTE* pData, int width, int height, int stride, Gdiplus::Bi
                     int invA = 255 - alpha;
                     int base = y * stride + (x / 2) * 4;
                     int yP = base + (x % 2) * 2;
-                    BYTE Y = (BYTE)((0.299 * pS[2]) + (0.587 * pS[1]) + (0.114 * pS[0]));
-                    BYTE U = (BYTE)(-(0.1687 * pS[2]) - (0.3313 * pS[1]) + (0.5 * pS[0]) + 128);
-                    BYTE V = (BYTE)((0.5 * pS[2]) - (0.4187 * pS[1]) - (0.0813 * pS[0]) + 128);
-                    pData[yP] = (BYTE)((Y * alpha + pData[yP] * invA) >> 8);
-                    pData[base + 1] = (BYTE)((U * alpha + pData[base + 1] * invA) >> 8);
-                    pData[base + 3] = (BYTE)((V * alpha + pData[base + 3] * invA) >> 8);
+                    
+                    // BT.709 Premultiplied YUV shifts (multiplied by 1000 for integer math)
+                    int Yp = (183 * pS[2] + 614 * pS[1] + 62 * pS[0]) / 1000;
+                    int Up = (-101 * pS[2] - 339 * pS[1] + 439 * pS[0]) / 1000;
+                    int Vp = (439 * pS[2] - 399 * pS[1] - 40 * pS[0]) / 1000;
+
+                    pData[yP] = (BYTE)(Yp + ((16 * alpha + pData[yP] * invA + 127) >> 8));
+                    if (x % 2 == 0) { // U/V shared for 2 pixels
+                        pData[base + 1] = (BYTE)(Up + ((128 * alpha + pData[base + 1] * invA + 127) >> 8));
+                        pData[base + 3] = (BYTE)(Vp + ((128 * alpha + pData[base + 3] * invA + 127) >> 8));
+                    }
                 }
             }
         }
@@ -177,7 +186,7 @@ void BlendARGBtoYUY2(BYTE* pData, int width, int height, int stride, Gdiplus::Bi
 
 void BlendARGBtoNV12(BYTE* pY, BYTE* pUV, int width, int height, int stride, Gdiplus::Bitmap* pBmp) {
     Gdiplus::BitmapData bd; Gdiplus::Rect rc(0, 0, pBmp->GetWidth(), pBmp->GetHeight());
-    if (pBmp->LockBits(&rc, Gdiplus::ImageLockModeRead, PixelFormat32bppARGB, &bd) == Gdiplus::Ok) {
+    if (pBmp->LockBits(&rc, Gdiplus::ImageLockModeRead, PixelFormat32bppPARGB, &bd) == Gdiplus::Ok) {
         BYTE* pSrc = (BYTE*)bd.Scan0;
         int dW = (std::min)(width, (int)pBmp->GetWidth()), dH = (std::min)(height, (int)pBmp->GetHeight());
         for (int y = 0; y < dH; y++) {
@@ -186,14 +195,19 @@ void BlendARGBtoNV12(BYTE* pY, BYTE* pUV, int width, int height, int stride, Gdi
                 BYTE* pS = pSrc + (y * bd.Stride) + (srcX * 4);
                 int alpha = pS[3];
                 if (alpha > 0) {
-                    int invA = 255 - alpha; int yPos = y * stride + x;
-                    int uvIdx = (y / 2) * stride + (x / 2) * 2;
-                    BYTE Y = (BYTE)((0.299 * pS[2]) + (0.587 * pS[1]) + (0.114 * pS[0]));
-                    BYTE U = (BYTE)(-(0.1687 * pS[2]) - (0.3313 * pS[1]) + (0.5 * pS[0]) + 128);
-                    BYTE V = (BYTE)((0.5 * pS[2]) - (0.4187 * pS[1]) - (0.0813 * pS[0]) + 128);
-                    pY[yPos] = (BYTE)((Y * alpha + pY[yPos] * invA) >> 8);
-                    pUV[uvIdx] = (BYTE)((U * alpha + pUV[uvIdx] * invA) >> 8);
-                    pUV[uvIdx + 1] = (BYTE)((V * alpha + pUV[uvIdx + 1] * invA) >> 8);
+                    int invA = 255 - alpha;
+                    int yPos = y * stride + x;
+                    
+                    int Yp = (183 * pS[2] + 614 * pS[1] + 62 * pS[0]) / 1000;
+                    pY[yPos] = (BYTE)(Yp + ((16 * alpha + pY[yPos] * invA + 127) >> 8));
+
+                    if (y % 2 == 0 && x % 2 == 0) {
+                        int uvIdx = (y / 2) * stride + (x / 2) * 2;
+                        int Up = (-101 * pS[2] - 339 * pS[1] + 439 * pS[0]) / 1000;
+                        int Vp = (439 * pS[2] - 399 * pS[1] - 40 * pS[0]) / 1000;
+                        pUV[uvIdx] = (BYTE)(Up + ((128 * alpha + pUV[uvIdx] * invA + 127) >> 8));
+                        pUV[uvIdx + 1] = (BYTE)(Vp + ((128 * alpha + pUV[uvIdx + 1] * invA + 127) >> 8));
+                    }
                 }
             }
         }
@@ -203,7 +217,7 @@ void BlendARGBtoNV12(BYTE* pY, BYTE* pUV, int width, int height, int stride, Gdi
 
 void BlendARGBtoBGRA(BYTE* pData, int width, int height, int stride, Gdiplus::Bitmap* pBmp) {
     Gdiplus::BitmapData bd; Gdiplus::Rect rc(0, 0, pBmp->GetWidth(), pBmp->GetHeight());
-    if (pBmp->LockBits(&rc, Gdiplus::ImageLockModeRead, PixelFormat32bppARGB, &bd) == Gdiplus::Ok) {
+    if (pBmp->LockBits(&rc, Gdiplus::ImageLockModeRead, PixelFormat32bppPARGB, &bd) == Gdiplus::Ok) {
         BYTE* pSrc = (BYTE*)bd.Scan0;
         int dW = (std::min)(width, (int)pBmp->GetWidth()), dH = (std::min)(height, (int)pBmp->GetHeight());
         int bpp = stride / width;
@@ -215,9 +229,10 @@ void BlendARGBtoBGRA(BYTE* pData, int width, int height, int stride, Gdiplus::Bi
                 if (alpha > 0) {
                     BYTE* pD = pData + (y * stride) + (x * bpp);
                     int invA = 255 - alpha;
-                    pD[0] = (BYTE)((pS[0] * alpha + pD[0] * invA) >> 8);
-                    pD[1] = (BYTE)((pS[1] * alpha + pD[1] * invA) >> 8);
-                    pD[2] = (BYTE)((pS[2] * alpha + pD[2] * invA) >> 8);
+                    // Standard Premultiplied Blend: Dest = Source + Dest * (1 - Alpha)
+                    pD[0] = (BYTE)(pS[0] + ((pD[0] * invA + 127) >> 8)); // B
+                    pD[1] = (BYTE)(pS[1] + ((pD[1] * invA + 127) >> 8)); // G
+                    pD[2] = (BYTE)(pS[2] + ((pD[2] * invA + 127) >> 8)); // R
                     if (bpp == 4) pD[3] = 255;
                 }
             }
@@ -230,18 +245,18 @@ static void ProcessWatermarkInternal(BYTE* pData, int width, int height, int for
     if (isCompressed || !pData || width <= 0 || height <= 0) return;
     std::lock_guard<std::mutex> shmLock(g_sharedMemMutex);
     if (g_pWatermarkBuffer && g_watermarkW > 0 && g_watermarkH > 0) {
-        Gdiplus::Bitmap* pSrcBmp = new Gdiplus::Bitmap(g_watermarkW, g_watermarkH, g_watermarkW * 4, PixelFormat32bppARGB, g_pWatermarkBuffer);
+        // Source is PixelFormats.Pbgra32 (Premultiplied)
+        Gdiplus::Bitmap* pSrcBmp = new Gdiplus::Bitmap(g_watermarkW, g_watermarkH, g_watermarkW * 4, PixelFormat32bppPARGB, g_pWatermarkBuffer);
         if (pSrcBmp) {
             Gdiplus::Bitmap* pTargetBmp = pSrcBmp;
             bool needDeleteTarget = false;
 
-            // Resize if dimensions don't match, maintaining aspect ratio
             if (g_watermarkW != width || g_watermarkH != height) {
-                pTargetBmp = new Gdiplus::Bitmap(width, height, PixelFormat32bppARGB);
+                pTargetBmp = new Gdiplus::Bitmap(width, height, PixelFormat32bppPARGB);
                 if (pTargetBmp) {
                     Gdiplus::Graphics g(pTargetBmp);
                     g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
-                    g.Clear(Gdiplus::Color(0, 0, 0, 0)); // Đảm bảo nền trong suốt
+                    g.Clear(Gdiplus::Color(0, 0, 0, 0)); 
 
                     float srcAspect = (float)g_watermarkW / g_watermarkH;
                     float dstAspect = (float)width / height;
