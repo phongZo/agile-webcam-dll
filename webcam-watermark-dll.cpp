@@ -158,7 +158,7 @@ void BlendARGBtoYUY2(BYTE* pData, int width, int height, int stride, Gdiplus::Bi
                 int srcX = g_isMirrorMode ? (dW - 1 - x) : x;
                 BYTE* pS = pSrc + (y * bd.Stride) + (srcX * 4);
                 int alpha = pS[3];
-                if (alpha > 30) {
+                if (alpha > 0) {
                     int invA = 255 - alpha;
                     int base = y * stride + (x / 2) * 4;
                     int yP = base + (x % 2) * 2;
@@ -185,7 +185,7 @@ void BlendARGBtoNV12(BYTE* pY, BYTE* pUV, int width, int height, int stride, Gdi
                 int srcX = g_isMirrorMode ? (dW - 1 - x) : x;
                 BYTE* pS = pSrc + (y * bd.Stride) + (srcX * 4);
                 int alpha = pS[3];
-                if (alpha > 30) {
+                if (alpha > 0) {
                     int invA = 255 - alpha; int yPos = y * stride + x;
                     int uvIdx = (y / 2) * stride + (x / 2) * 2;
                     BYTE Y = (BYTE)((0.299 * pS[2]) + (0.587 * pS[1]) + (0.114 * pS[0]));
@@ -212,7 +212,7 @@ void BlendARGBtoBGRA(BYTE* pData, int width, int height, int stride, Gdiplus::Bi
                 int srcX = g_isMirrorMode ? (dW - 1 - x) : x;
                 BYTE* pS = pSrc + (y * bd.Stride) + (srcX * 4);
                 int alpha = pS[3];
-                if (alpha > 30) {
+                if (alpha > 0) {
                     BYTE* pD = pData + (y * stride) + (x * bpp);
                     int invA = 255 - alpha;
                     pD[0] = (BYTE)((pS[0] * alpha + pD[0] * invA) >> 8);
