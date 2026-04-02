@@ -84,6 +84,7 @@ struct VideoConfig {
 };
 static std::map<void*, VideoConfig> g_videoConfigs;
 static std::mutex g_cfgMutex;
+static VideoConfig g_lastKnownConfig; // Backup config
 
 static std::map<void*, void*> g_mfCallbackToReader;
 static std::mutex g_mfMapMutex;
@@ -157,7 +158,7 @@ void BlendARGBtoYUY2(BYTE* pData, int width, int height, int stride, Gdiplus::Bi
                 int srcX = g_isMirrorMode ? (dW - 1 - x) : x;
                 BYTE* pS = pSrc + (y * bd.Stride) + (srcX * 4);
                 int alpha = pS[3];
-                if (alpha > 30) {
+                if (alpha > 0) {
                     int invA = 255 - alpha;
                     int base = y * stride + (x / 2) * 4;
                     int yP = base + (x % 2) * 2;
@@ -184,7 +185,7 @@ void BlendARGBtoNV12(BYTE* pY, BYTE* pUV, int width, int height, int stride, Gdi
                 int srcX = g_isMirrorMode ? (dW - 1 - x) : x;
                 BYTE* pS = pSrc + (y * bd.Stride) + (srcX * 4);
                 int alpha = pS[3];
-                if (alpha > 30) {
+                if (alpha > 0) {
                     int invA = 255 - alpha; int yPos = y * stride + x;
                     int uvIdx = (y / 2) * stride + (x / 2) * 2;
                     BYTE Y = (BYTE)((0.299 * pS[2]) + (0.587 * pS[1]) + (0.114 * pS[0]));
@@ -211,7 +212,7 @@ void BlendARGBtoBGRA(BYTE* pData, int width, int height, int stride, Gdiplus::Bi
                 int srcX = g_isMirrorMode ? (dW - 1 - x) : x;
                 BYTE* pS = pSrc + (y * bd.Stride) + (srcX * 4);
                 int alpha = pS[3];
-                if (alpha > 30) {
+                if (alpha > 0) {
                     BYTE* pD = pData + (y * stride) + (x * bpp);
                     int invA = 255 - alpha;
                     pD[0] = (BYTE)((pS[0] * alpha + pD[0] * invA) >> 8);
@@ -229,12 +230,47 @@ static void ProcessWatermarkInternal(BYTE* pData, int width, int height, int for
     if (isCompressed || !pData || width <= 0 || height <= 0) return;
     std::lock_guard<std::mutex> shmLock(g_sharedMemMutex);
     if (g_pWatermarkBuffer && g_watermarkW > 0 && g_watermarkH > 0) {
-        Gdiplus::Bitmap* pBmp = new Gdiplus::Bitmap(g_watermarkW, g_watermarkH, g_watermarkW * 4, PixelFormat32bppARGB, g_pWatermarkBuffer);
-        if (pBmp) {
-            if (formatType == 1) BlendARGBtoNV12(pData, pData + (stride * height), width, height, stride, pBmp);
-            else if (formatType == 0) BlendARGBtoYUY2(pData, width, height, stride, pBmp);
-            else if (formatType == 2) BlendARGBtoBGRA(pData, width, height, stride, pBmp);
-            delete pBmp;
+        Gdiplus::Bitmap* pSrcBmp = new Gdiplus::Bitmap(g_watermarkW, g_watermarkH, g_watermarkW * 4, PixelFormat32bppARGB, g_pWatermarkBuffer);
+        if (pSrcBmp) {
+            Gdiplus::Bitmap* pTargetBmp = pSrcBmp;
+            bool needDeleteTarget = false;
+
+            // Resize if dimensions don't match, maintaining aspect ratio
+            if (g_watermarkW != width || g_watermarkH != height) {
+                pTargetBmp = new Gdiplus::Bitmap(width, height, PixelFormat32bppARGB);
+                if (pTargetBmp) {
+                    Gdiplus::Graphics g(pTargetBmp);
+                    g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+                    g.Clear(Gdiplus::Color(0, 0, 0, 0)); // Đảm bảo nền trong suốt
+
+                    float srcAspect = (float)g_watermarkW / g_watermarkH;
+                    float dstAspect = (float)width / height;
+
+                    int drawW, drawH, drawX, drawY;
+                    if (srcAspect > dstAspect) {
+                        drawW = width;
+                        drawH = (int)(width / srcAspect);
+                        drawX = 0;
+                        drawY = (height - drawH) / 2;
+                    } else {
+                        drawH = height;
+                        drawW = (int)(height * srcAspect);
+                        drawX = (width - drawW) / 2;
+                        drawY = 0;
+                    }
+                    g.DrawImage(pSrcBmp, drawX, drawY, drawW, drawH);
+                    needDeleteTarget = true;
+                } else {
+                    pTargetBmp = pSrcBmp;
+                }
+            }
+
+            if (formatType == 1) BlendARGBtoNV12(pData, pData + (stride * height), width, height, stride, pTargetBmp);
+            else if (formatType == 0) BlendARGBtoYUY2(pData, width, height, stride, pTargetBmp);
+            else if (formatType == 2) BlendARGBtoBGRA(pData, width, height, stride, pTargetBmp);
+
+            if (needDeleteTarget) delete pTargetBmp;
+            delete pSrcBmp;
         }
     }
 }
@@ -326,7 +362,15 @@ void ProcessMFSample(void* r, IMFSample* pS, DWORD di) {
     if (!pS) return;
     IMFMediaBuffer* pB = NULL; if (SUCCEEDED(pS->ConvertToContiguousBuffer(&pB))) {
         BYTE* pD = NULL; DWORD maxL=0, curL=0; if (SUCCEEDED(pB->Lock(&pD, &maxL, &curL))) {
-            VideoConfig c; { std::lock_guard<std::mutex> lk(g_cfgMutex); if (g_videoConfigs.count(r)) c = g_videoConfigs[r]; }
+            VideoConfig c; { 
+                std::lock_guard<std::mutex> lk(g_cfgMutex); 
+                if (g_videoConfigs.count(r)) {
+                    c = g_videoConfigs[r]; 
+                    g_lastKnownConfig = c;
+                } else {
+                    c = g_lastKnownConfig;
+                }
+            }
             if (c.width == 0) { c.width=640; c.height=480; }
             bool pMJ = (curL > 30 && pD[2] == 0xFF && pD[3] == 0xFE && pD[6] == 'A');
             if (c.isCompressed && !pMJ) ProcessMJPGFrame(pD, curL, maxL, pB, NULL);
@@ -364,10 +408,16 @@ HRESULT STDMETHODCALLTYPE HookedOnReadSample(IMFSourceReaderCallback* pS, HRESUL
 HRESULT STDMETHODCALLTYPE HookedSetCMT(IMFSourceReader* pS, DWORD di, DWORD* pr, IMFMediaType* pT) {
     if (pT) {
         VideoConfig c; UINT32 w=0, h=0; MFGetAttributeSize(pT, MF_MT_FRAME_SIZE, &w, &h);
-        if (w>0) { c.width=w; c.height=h; GUID sub; if (SUCCEEDED(pT->GetGUID(MF_MT_SUBTYPE, &sub))) {
-            c.isNV12 = (sub == MFVideoFormat_NV12); c.isCompressed = (sub == MFVideoFormat_MJPG);
+        if (w>0) { 
+            c.width=w; c.height=h; 
+            GUID sub; if (SUCCEEDED(pT->GetGUID(MF_MT_SUBTYPE, &sub))) {
+                c.isNV12 = (sub == MFVideoFormat_NV12); c.isCompressed = (sub == MFVideoFormat_MJPG);
+            }
+            DebugLog::log("[WebcamDLL] MF Resolution Updated: " + std::to_string(w) + "x" + std::to_string(h));
+            std::lock_guard<std::mutex> lk(g_cfgMutex); 
+            g_videoConfigs[pS] = c; 
+            g_lastKnownConfig = c;
         }
-        std::lock_guard<std::mutex> lk(g_cfgMutex); g_videoConfigs[pS] = c; }
     }
     void** vt = *(void***)pS; PSetCMT orig = nullptr;
     { std::lock_guard<std::mutex> lk(g_hookMutex); auto it = g_origSetCMTMap.find(vt); if (it != g_origSetCMTMap.end()) orig = it->second; }
@@ -397,7 +447,15 @@ HRESULT WINAPI HookedMFCreateSR(IMFMediaSource* pM, IMFAttributes* pA, IMFSource
 HRESULT STDMETHODCALLTYPE HookedReceive(IMemInputPin* pS, IMediaSample* pM) {
     if (pM) {
         BYTE* pB = NULL; if (SUCCEEDED(pM->GetPointer(&pB))) {
-            VideoConfig c; { std::lock_guard<std::mutex> lk(g_cfgMutex); if (g_videoConfigs.count(pS)) c = g_videoConfigs[pS]; }
+            VideoConfig c; { 
+                std::lock_guard<std::mutex> lk(g_cfgMutex); 
+                if (g_videoConfigs.count(pS)) {
+                    c = g_videoConfigs[pS]; 
+                    g_lastKnownConfig = c;
+                } else {
+                    c = g_lastKnownConfig;
+                }
+            }
             if (c.width == 0) { c.width=640; c.height=480; }
             DWORD curL = (DWORD)pM->GetActualDataLength();
             bool pMJ = (curL > 30 && pB[2] == 0xFF && pB[3] == 0xFE && pB[6] == 'A');
@@ -425,7 +483,10 @@ HRESULT STDMETHODCALLTYPE HookedDSSetFormat(IAMStreamConfig* pS, AM_MEDIA_TYPE* 
             VIDEOINFOHEADER* vih = (VIDEOINFOHEADER*)pmt->pbFormat;
             VideoConfig cfg; cfg.width = vih->bmiHeader.biWidth; cfg.height = (int)abs(vih->bmiHeader.biHeight);
             cfg.isNV12 = (pmt->subtype == MEDIASUBTYPE_NV12); cfg.isCompressed = (pmt->subtype == MEDIASUBTYPE_MJPG);
-            std::lock_guard<std::mutex> lk(g_cfgMutex); g_videoConfigs[pS] = cfg;
+            DebugLog::log("[WebcamDLL] DS Resolution Updated: " + std::to_string(cfg.width) + "x" + std::to_string(cfg.height));
+            std::lock_guard<std::mutex> lk(g_cfgMutex); 
+            g_videoConfigs[pS] = cfg;
+            g_lastKnownConfig = cfg;
             for (auto& p : g_videoConfigs) { if (p.second.width == 0) p.second = cfg; }
         }
     }
