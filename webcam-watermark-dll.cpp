@@ -15,8 +15,8 @@
 #include <algorithm>
 #include <vector>
 #include "DebugLog.h"
-#include "../packages/minhook.1.3.3/lib/native/include/MinHook.h"
-#include <nlohmann/json.hpp>
+#include "packages/minhook.1.3.3/lib/native/include/MinHook.h"
+#include "packages/nlohmann.json.3.12.0/build/native/include/nlohmann/json.hpp"
 #include "JpegHelper.h"
 
 #pragma comment(lib, "strmiids.lib")
@@ -30,9 +30,9 @@
 using json = nlohmann::json;
 
 #ifdef _WIN64
-    #pragma comment(lib, "../packages/minhook.1.3.3/lib/native/lib/libMinHook-x64-v141-mt.lib")
+    #pragma comment(lib, "packages/minhook.1.3.3/lib/native/lib/libMinHook-x64-v141-mt.lib")
 #else
-    #pragma comment(lib, "../packages/minhook.1.3.3/lib/native/lib/libMinHook-x86-v141-mt.lib")
+    #pragma comment(lib, "packages/minhook.1.3.3/lib/native/lib/libMinHook-x86-v141-mt.lib")
 #endif
 
 // --- Core Helpers ---
