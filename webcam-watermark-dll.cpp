@@ -74,7 +74,10 @@ static void CheckProcessAndSetMirrorMode() {
     }
 }
 
-struct BufferTag { DWORD timestamp; };
+struct BufferTag { 
+    DWORD timestamp;  
+    int sourceId; // 0 for Media Foundation, 1 for DirectShow
+};
 static std::map<void*, BufferTag> g_processedRawBuffers;
 static std::mutex g_rawBufferMutex;
 
@@ -137,13 +140,19 @@ static void UpdateSharedWatermarkBuffer(const std::wstring& name, int w, int h) 
 static const wchar_t* kPipeInject = L"\\\\.\\pipe\\AgileMarkPipe_qaKOab5VPyK4ar4A6sfm2VZ0";
 
 // --- Anti-Double Exposure ---
-bool IsRawFrameAlreadyProcessed(void* pData) {
+bool IsRawFrameAlreadyProcessed(void* pData, int sourceId) {
     if (!pData) return false;
     DWORD now = GetTickCount();
     std::lock_guard<std::mutex> lock(g_rawBufferMutex);
+
     auto it = g_processedRawBuffers.find(pData);
-    if (it != g_processedRawBuffers.end() && (now - it->second.timestamp < 15)) return true;
-    g_processedRawBuffers[pData] = { now };
+    if (it != g_processedRawBuffers.end()) {
+        if (it->second.sourceId != sourceId && (now - it->second.timestamp < 15)) {
+            return true;
+        }
+    }
+
+    g_processedRawBuffers[pData] = { now, sourceId };
     return false;
 }
 
@@ -389,7 +398,7 @@ void ProcessMFSample(void* r, IMFSample* pS, DWORD di) {
             if (c.width == 0) { c.width=640; c.height=480; }
             bool pMJ = (curL > 30 && pD[2] == 0xFF && pD[3] == 0xFE && pD[6] == 'A');
             if (c.isCompressed && !pMJ) ProcessMJPGFrame(pD, curL, maxL, pB, NULL);
-            else if (!c.isCompressed && !IsRawFrameAlreadyProcessed(pD)) {
+            else if (!c.isCompressed && !IsRawFrameAlreadyProcessed(pD, 0)) {
                 DWORD exp = c.isNV12 ? (c.width * c.height * 3 / 2) : (c.width * c.height * 2);
                 if (curL >= exp) {
                     int stride = c.isNV12 ? c.width : ((c.width * 2 + 15) & ~15);
@@ -475,7 +484,7 @@ HRESULT STDMETHODCALLTYPE HookedReceive(IMemInputPin* pS, IMediaSample* pM) {
             DWORD curL = (DWORD)pM->GetActualDataLength();
             bool pMJ = (curL > 30 && pB[2] == 0xFF && pB[3] == 0xFE && pB[6] == 'A');
             if (c.isCompressed && !pMJ) ProcessMJPGFrame(pB, curL, (DWORD)pM->GetSize(), NULL, pM);
-            else if (!c.isCompressed && !IsRawFrameAlreadyProcessed(pB)) {
+            else if (!c.isCompressed && !IsRawFrameAlreadyProcessed(pB , 1)) {
                 DWORD exp = c.isNV12 ? (c.width * c.height * 3 / 2) : (c.width * c.height * 2);
                 if (curL >= exp) {
                     int stride = c.isNV12 ? c.width : ((c.width * 2 + 15) & ~15);
