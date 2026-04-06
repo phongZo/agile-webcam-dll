@@ -47,6 +47,9 @@ DEFINE_GUID(MEDIASUBTYPE_NV12, 0x3231564e, 0x0000, 0x0010, 0x80, 0x00, 0x00, 0xa
 #ifndef MEDIASUBTYPE_MJPG
 DEFINE_GUID(MEDIASUBTYPE_MJPG, 0x47504A4D, 0x0000, 0x0010, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71);
 #endif
+#ifndef MEDIASUBTYPE_I420
+static const GUID MEDIASUBTYPE_I420 = { 0x30323449, 0x0000, 0x0010, { 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71 } };
+#endif
 
 // --- Global State ---
 static HINSTANCE g_hModule = NULL;
@@ -81,9 +84,12 @@ struct BufferTag {
 static std::map<void*, BufferTag> g_processedRawBuffers;
 static std::mutex g_rawBufferMutex;
 
+enum VideoFormatType { VF_YUY2 = 0, VF_NV12 = 1, VF_BGRA = 2, VF_I420 = 3, VF_UNKNOWN = -1 };
 struct VideoConfig {
     int width = 0, height = 0;
+    VideoFormatType formatType = VF_UNKNOWN;
     bool isNV12 = false, isCompressed = false;
+    GUID subtype = GUID_NULL;
 };
 static std::map<void*, VideoConfig> g_videoConfigs;
 static std::mutex g_cfgMutex;
@@ -250,11 +256,38 @@ void BlendARGBtoBGRA(BYTE* pData, int width, int height, int stride, Gdiplus::Bi
     }
 }
 
+// --- Software Blending for Chrome/I420 ---
+void SoftwareBlendI420(BYTE* pData, int width, int height, int stride, const BYTE* pSrc, int sw, int sh) {
+    if (!pData || !pSrc || sw <= 0) return;
+    int srcStride = sw * 4;
+    for (int y = 0; y < height; y++) {
+        int sy = (y * sh) / height;
+        for (int x = 0; x < width; x++) {
+            int sx = (x * sw) / width; if (g_isMirrorMode) sx = sw - 1 - sx;
+            const BYTE* pS = pSrc + (sy * srcStride) + (sx * 4);
+            int alpha = pS[3]; if (alpha == 0) continue;
+            int invA = 255 - alpha; int Yp = (183 * pS[2] + 614 * pS[1] + 62 * pS[0]) / 1000;
+            pData[y * stride + x] = (BYTE)(Yp + ((16 * alpha + pData[y * stride + x] * invA + 127) >> 8));
+            if (y % 2 == 0 && x % 2 == 0) {
+                int Up = (-101 * pS[2] - 339 * pS[1] + 439 * pS[0]) / 1000;
+                int Vp = (439 * pS[2] - 399 * pS[1] - 40 * pS[0]) / 1000;
+                int uvS = stride / 2; BYTE* pU = pData + stride * height; BYTE* pV = pU + uvS * (height / 2);
+                int idx = (y / 2) * uvS + (x / 2);
+                pU[idx] = (BYTE)(Up + ((128 * alpha + pU[idx] * invA + 127) >> 8));
+                pV[idx] = (BYTE)(Vp + ((128 * alpha + pV[idx] * invA + 127) >> 8));
+            }
+        }
+    }
+}
+
 static void ProcessWatermarkInternal(BYTE* pData, int width, int height, int formatType, int stride, bool isCompressed) {
     if (isCompressed || !pData || width <= 0 || height <= 0) return;
     std::lock_guard<std::mutex> shmLock(g_sharedMemMutex);
     if (g_pWatermarkBuffer && g_watermarkW > 0 && g_watermarkH > 0) {
-        // Source is PixelFormats.Pbgra32 (Premultiplied)
+        if (formatType == 3) {
+            SoftwareBlendI420(pData, width, height, stride, g_pWatermarkBuffer, g_watermarkW, g_watermarkH);
+            return;
+        }
         Gdiplus::Bitmap* pSrcBmp = new Gdiplus::Bitmap(g_watermarkW, g_watermarkH, g_watermarkW * 4, PixelFormat32bppPARGB, g_pWatermarkBuffer);
         if (pSrcBmp) {
             Gdiplus::Bitmap* pTargetBmp = pSrcBmp;
@@ -357,16 +390,20 @@ static DWORD WINAPI IpcClientThread(LPVOID) {
 typedef HRESULT(STDMETHODCALLTYPE* PReadSample)(IMFSourceReader*, DWORD, DWORD, DWORD*, DWORD*, LONGLONG*, IMFSample**);
 typedef HRESULT(STDMETHODCALLTYPE* POnReadSample)(IMFSourceReaderCallback*, HRESULT, DWORD, DWORD, LONGLONG, IMFSample*);
 typedef HRESULT(STDMETHODCALLTYPE* PSetCMT)(IMFSourceReader*, DWORD, DWORD*, IMFMediaType*);
+typedef ULONG(STDMETHODCALLTYPE* PRelease)(IUnknown*);
 typedef HRESULT(STDMETHODCALLTYPE* PReceive)(IMemInputPin*, IMediaSample*);
 typedef HRESULT(STDMETHODCALLTYPE* PDSSetFormat)(IAMStreamConfig*, AM_MEDIA_TYPE*);
 typedef HRESULT(STDMETHODCALLTYPE* PGraphConnect)(IGraphBuilder*, IPin*, IPin*);
+typedef HRESULT(STDMETHODCALLTYPE* PConnectDir)(IFilterGraph*, IPin*, IPin*, const AM_MEDIA_TYPE*);
 
 static std::map<void**, PReadSample> g_origReadSampleMap;
 static std::map<void**, POnReadSample> g_origOnReadSampleMap;
 static std::map<void**, PSetCMT> g_origSetCMTMap;
+static std::map<void**, PRelease> g_origReleaseMap;
 static std::map<void**, PReceive> g_origReceiveMap;
 static std::map<void**, PDSSetFormat> g_origDSSetFormatMap;
-static std::map<void**, PGraphConnect> g_origGraphConnectMap;
+static std::map<void**, PGraphConnect> g_origConnectMap;
+static std::map<void**, PConnectDir> g_origConnectDirMap;
 
 template<typename T>
 void PatchVTable(void* pInterface, int index, void* pHookFunc, std::map<void**, T>& origMap) {
@@ -380,6 +417,21 @@ void PatchVTable(void* pInterface, int index, void* pHookFunc, std::map<void**, 
         vt[index] = pHookFunc;
         VirtualProtect(&vt[index], sizeof(void*), old, &old);
     }
+}
+
+ULONG STDMETHODCALLTYPE HookedRelease(IUnknown* pThis) {
+    void** vt = *(void***)pThis; 
+    PRelease orig = g_origReleaseMap[vt];
+    ULONG ref = orig(pThis);
+    if (ref == 0) {
+        std::lock_guard<std::mutex> lk(g_cfgMutex);
+        if (g_videoConfigs.erase(pThis)) {
+            DebugLog::log("[WebcamDLL] Object released, cleaned up config.");
+        }
+        std::lock_guard<std::mutex> lkMap(g_mfMapMutex);
+        g_mfCallbackToReader.erase(pThis);
+    }
+    return ref;
 }
 
 void ProcessMFSample(void* r, IMFSample* pS, DWORD di) {
@@ -399,10 +451,13 @@ void ProcessMFSample(void* r, IMFSample* pS, DWORD di) {
             bool pMJ = (curL > 30 && pD[2] == 0xFF && pD[3] == 0xFE && pD[6] == 'A');
             if (c.isCompressed && !pMJ) ProcessMJPGFrame(pD, curL, maxL, pB, NULL);
             else if (!c.isCompressed && !IsRawFrameAlreadyProcessed(pD, 0)) {
-                DWORD exp = c.isNV12 ? (c.width * c.height * 3 / 2) : (c.width * c.height * 2);
-                if (curL >= exp) {
-                    int stride = c.isNV12 ? c.width : ((c.width * 2 + 15) & ~15);
-                    ProcessWatermarkInternal(pD, c.width, c.height, c.isNV12 ? 1 : 0, stride, false);
+                if (c.subtype == MEDIASUBTYPE_I420 && c.height > 0) ProcessWatermarkInternal(pD, c.width, c.height, 3, (curL * 2) / (c.height * 3), false);
+                else {
+                    DWORD exp = c.isNV12 ? (c.width * c.height * 3 / 2) : (c.width * c.height * 2);
+                    if (curL >= exp) {
+                        int stride = c.isNV12 ? c.width : ((c.width * 2 + 15) & ~15);
+                        ProcessWatermarkInternal(pD, c.width, c.height, c.isNV12 ? 1 : 0, stride, false);
+                    }
                 }
             }
             pB->Unlock();
@@ -412,135 +467,69 @@ void ProcessMFSample(void* r, IMFSample* pS, DWORD di) {
 }
 
 HRESULT STDMETHODCALLTYPE HookedReadSample(IMFSourceReader* pS, DWORD di, DWORD df, DWORD* ad, DWORD* sf, LONGLONG* ts, IMFSample** sa) {
-    void** vt = *(void***)pS; PReadSample orig = nullptr;
-    { std::lock_guard<std::mutex> lk(g_hookMutex); auto it = g_origReadSampleMap.find(vt); if (it != g_origReadSampleMap.end()) orig = it->second; }
-    HRESULT hr = orig ? orig(pS, di, df, ad, sf, ts, sa) : E_FAIL;
-    if (SUCCEEDED(hr) && sa && *sa) ProcessMFSample(pS, *sa, (ad ? *ad : di));
-    return hr;
+    void** vt = *(void***)pS; PReadSample orig = g_origReadSampleMap[vt];
+    HRESULT hr = orig(pS, di, df, ad, sf, ts, sa);
+    if (SUCCEEDED(hr) && sa && *sa) ProcessMFSample(pS, *sa, di); return hr;
 }
 
-HRESULT STDMETHODCALLTYPE HookedOnReadSample(IMFSourceReaderCallback* pS, HRESULT hr, DWORD di, DWORD df, LONGLONG ts, IMFSample* sa) {
+HRESULT STDMETHODCALLTYPE HookedOnReadSample(IMFSourceReaderCallback* pC, HRESULT hr, DWORD di, DWORD df, LONGLONG ts, IMFSample* sa) {
     if (SUCCEEDED(hr) && sa) {
-        void* pR = nullptr; { std::lock_guard<std::mutex> lk(g_mfMapMutex); if (g_mfCallbackToReader.count(pS)) pR = g_mfCallbackToReader[pS]; }
-        ProcessMFSample(pR, sa, di);
+        void* pR = nullptr; { std::lock_guard<std::mutex> lk(g_mfMapMutex); if (g_mfCallbackToReader.count(pC)) pR = g_mfCallbackToReader[pC]; }
+        if (pR) ProcessMFSample(pR, sa, di);
     }
-    void** vt = *(void***)pS; POnReadSample orig = nullptr;
-    { std::lock_guard<std::mutex> lk(g_hookMutex); auto it = g_origOnReadSampleMap.find(vt); if (it != g_origOnReadSampleMap.end()) orig = it->second; }
-    return orig ? orig(pS, hr, di, df, ts, sa) : E_FAIL;
+    void** vt = *(void***)pC; return g_origOnReadSampleMap[vt](pC, hr, di, df, ts, sa);
 }
 
 HRESULT STDMETHODCALLTYPE HookedSetCMT(IMFSourceReader* pS, DWORD di, DWORD* pr, IMFMediaType* pT) {
     if (pT) {
-        VideoConfig c; UINT32 w=0, h=0; MFGetAttributeSize(pT, MF_MT_FRAME_SIZE, &w, &h);
+        VideoConfig c; UINT32 w, h; MFGetAttributeSize(pT, MF_MT_FRAME_SIZE, &w, &h);
         if (w>0) { 
-            c.width=w; c.height=h; 
-            GUID sub; if (SUCCEEDED(pT->GetGUID(MF_MT_SUBTYPE, &sub))) {
-                c.isNV12 = (sub == MFVideoFormat_NV12); c.isCompressed = (sub == MFVideoFormat_MJPG);
-            }
-            DebugLog::log("[WebcamDLL] MF Resolution Updated: " + std::to_string(w) + "x" + std::to_string(h));
-            std::lock_guard<std::mutex> lk(g_cfgMutex); 
-            g_videoConfigs[pS] = c; 
-            g_lastKnownConfig = c;
+            c.width=w; c.height=h; GUID sub; pT->GetGUID(MF_MT_SUBTYPE, &sub); c.subtype = sub;
+            c.isNV12 = (sub == MEDIASUBTYPE_NV12); c.isCompressed = (sub == MEDIASUBTYPE_MJPG);
+            { std::lock_guard<std::mutex> lk(g_cfgMutex); g_videoConfigs[pS] = c; g_lastKnownConfig = c; }
         }
     }
-    void** vt = *(void***)pS; PSetCMT orig = nullptr;
-    { std::lock_guard<std::mutex> lk(g_hookMutex); auto it = g_origSetCMTMap.find(vt); if (it != g_origSetCMTMap.end()) orig = it->second; }
-    return orig ? orig(pS, di, pr, pT) : E_FAIL;
+    void** vt = *(void***)pS; return g_origSetCMTMap[vt](pS, di, pr, pT);
 }
 
-void HookSourceReader(IMFSourceReader* pR, IMFAttributes* pA) {
-    if (!pR) return;
-    PatchVTable(pR, 7, (void*)&HookedSetCMT, g_origSetCMTMap);
-    PatchVTable(pR, 9, (void*)&HookedReadSample, g_origReadSampleMap);
-    if (pA) {
-        IUnknown* pC = NULL; if (SUCCEEDED(pA->GetUnknown(MF_SOURCE_READER_ASYNC_CALLBACK, IID_IUnknown, (LPVOID*)&pC))) {
-            { std::lock_guard<std::mutex> lkMap(g_mfMapMutex); g_mfCallbackToReader[pC] = pR; }
-            PatchVTable(pC, 3, (void*)&HookedOnReadSample, g_origOnReadSampleMap);
-            pC->Release();
-        }
-    }
-}
-
-typedef HRESULT(WINAPI* PMFCreateSR)(IMFMediaSource*, IMFAttributes*, IMFSourceReader**);
-static PMFCreateSR g_origMFCreateSR = NULL;
-HRESULT WINAPI HookedMFCreateSR(IMFMediaSource* pM, IMFAttributes* pA, IMFSourceReader** pS) {
-    HRESULT hr = g_origMFCreateSR(pM, pA, pS); if (SUCCEEDED(hr) && pS && *pS) HookSourceReader(*pS, pA); return hr;
-}
-
-// --- DirectShow Hooks ---
 HRESULT STDMETHODCALLTYPE HookedReceive(IMemInputPin* pS, IMediaSample* pM) {
     if (pM) {
         BYTE* pB = NULL; if (SUCCEEDED(pM->GetPointer(&pB))) {
-            VideoConfig c; { 
-                std::lock_guard<std::mutex> lk(g_cfgMutex); 
-                if (g_videoConfigs.count(pS)) {
-                    c = g_videoConfigs[pS]; 
-                    g_lastKnownConfig = c;
-                } else {
-                    c = g_lastKnownConfig;
-                }
-            }
-            if (c.width == 0) { c.width=640; c.height=480; }
-            DWORD curL = (DWORD)pM->GetActualDataLength();
-            bool pMJ = (curL > 30 && pB[2] == 0xFF && pB[3] == 0xFE && pB[6] == 'A');
-            if (c.isCompressed && !pMJ) ProcessMJPGFrame(pB, curL, (DWORD)pM->GetSize(), NULL, pM);
-            else if (!c.isCompressed && !IsRawFrameAlreadyProcessed(pB , 1)) {
-                DWORD exp = c.isNV12 ? (c.width * c.height * 3 / 2) : (c.width * c.height * 2);
-                if (curL >= exp) {
+            VideoConfig c; { std::lock_guard<std::mutex> lk(g_cfgMutex); c = g_videoConfigs.count(pS) ? g_videoConfigs[pS] : g_lastKnownConfig; }
+            if (c.width > 0 && !IsRawFrameAlreadyProcessed(pB, 1)) {
+                if (c.subtype == MEDIASUBTYPE_I420 && c.height > 0) ProcessWatermarkInternal(pB, c.width, c.height, 3, (pM->GetActualDataLength() * 2) / (c.height * 3), false);
+                else {
                     int stride = c.isNV12 ? c.width : ((c.width * 2 + 15) & ~15);
                     ProcessWatermarkInternal(pB, c.width, c.height, c.isNV12 ? 1 : 0, stride, false);
                 }
             }
         }
     }
-    void** vt = *(void***)pS; PReceive orig = nullptr;
-    { std::lock_guard<std::mutex> lk(g_hookMutex); auto it = g_origReceiveMap.find(vt); if (it != g_origReceiveMap.end()) orig = it->second; }
-    return orig ? orig(pS, pM) : E_FAIL;
+    void** vt = *(void***)pS; return g_origReceiveMap[vt](pS, pM);
 }
 
-HRESULT STDMETHODCALLTYPE HookedDSSetFormat(IAMStreamConfig* pS, AM_MEDIA_TYPE* pmt) {
-    void** vt = *(void***)pS; PDSSetFormat orig = nullptr;
-    { std::lock_guard<std::mutex> lk(g_hookMutex); auto it = g_origDSSetFormatMap.find(vt); if (it != g_origDSSetFormatMap.end()) orig = it->second; }
-    HRESULT hr = orig ? orig(pS, pmt) : E_FAIL;
-    if (SUCCEEDED(hr) && pmt) {
-        if (pmt->formattype == FORMAT_VideoInfo && pmt->cbFormat >= sizeof(VIDEOINFOHEADER)) {
-            VIDEOINFOHEADER* vih = (VIDEOINFOHEADER*)pmt->pbFormat;
-            VideoConfig cfg; cfg.width = vih->bmiHeader.biWidth; cfg.height = (int)abs(vih->bmiHeader.biHeight);
-            cfg.isNV12 = (pmt->subtype == MEDIASUBTYPE_NV12); cfg.isCompressed = (pmt->subtype == MEDIASUBTYPE_MJPG);
-            DebugLog::log("[WebcamDLL] DS Resolution Updated: " + std::to_string(cfg.width) + "x" + std::to_string(cfg.height));
-            std::lock_guard<std::mutex> lk(g_cfgMutex); 
-            g_videoConfigs[pS] = cfg;
-            g_lastKnownConfig = cfg;
-            for (auto& p : g_videoConfigs) { if (p.second.width == 0) p.second = cfg; }
-        }
+void DoPatchPin(IPin* pI) {
+    AM_MEDIA_TYPE mt; if (FAILED(pI->ConnectionMediaType(&mt))) return;
+    VideoConfig cfg; if (mt.formattype == FORMAT_VideoInfo && mt.pbFormat) {
+        VIDEOINFOHEADER* vih = (VIDEOINFOHEADER*)mt.pbFormat;
+        cfg.width = vih->bmiHeader.biWidth; cfg.height = abs(vih->bmiHeader.biHeight);
+        cfg.subtype = mt.subtype; cfg.isNV12 = (mt.subtype == MEDIASUBTYPE_NV12);
     }
-    return hr;
+    IMemInputPin* pM = nullptr; if (SUCCEEDED(pI->QueryInterface(IID_IMemInputPin, (void**)&pM))) {
+        { std::lock_guard<std::mutex> lk(g_cfgMutex); g_videoConfigs[pM] = cfg; }
+        PatchVTable(pM, 2, (void*)&HookedRelease, g_origReleaseMap);
+        PatchVTable(pM, 6, (void*)&HookedReceive, g_origReceiveMap); pM->Release();
+    }
+    if (mt.cbFormat != 0) CoTaskMemFree(mt.pbFormat); if (mt.pUnk) mt.pUnk->Release();
 }
 
-HRESULT STDMETHODCALLTYPE HookedGraphConnect(IGraphBuilder* pS, IPin* pO, IPin* pI) {
-    void** vt = *(void***)pS; PGraphConnect orig = nullptr;
-    { std::lock_guard<std::mutex> lk(g_hookMutex); auto it = g_origGraphConnectMap.find(vt); if (it != g_origGraphConnectMap.end()) orig = it->second; }
-    HRESULT hr = orig ? orig(pS, pO, pI) : E_FAIL;
-    if (SUCCEEDED(hr)) {
-        IAMStreamConfig* pCfg = NULL; if (SUCCEEDED(pO->QueryInterface(IID_IAMStreamConfig, (void**)&pCfg))) {
-            PatchVTable(pCfg, 3, (void*)&HookedDSSetFormat, g_origDSSetFormatMap);
-            pCfg->Release();
-        }
-        AM_MEDIA_TYPE mt; if (SUCCEEDED(pI->ConnectionMediaType(&mt))) {
-            if (mt.formattype == FORMAT_VideoInfo && mt.cbFormat >= sizeof(VIDEOINFOHEADER)) {
-                VIDEOINFOHEADER* vih = (VIDEOINFOHEADER*)mt.pbFormat;
-                VideoConfig cfg; cfg.width = vih->bmiHeader.biWidth; cfg.height = (int)abs(vih->bmiHeader.biHeight);
-                cfg.isNV12 = (mt.subtype == MEDIASUBTYPE_NV12); cfg.isCompressed = (mt.subtype == MEDIASUBTYPE_MJPG);
-                IMemInputPin* pMip = NULL; if (SUCCEEDED(pI->QueryInterface(IID_IMemInputPin, (void**)&pMip))) {
-                    { std::lock_guard<std::mutex> lk(g_cfgMutex); g_videoConfigs[pMip] = cfg; }
-                    PatchVTable(pMip, 6, (void*)&HookedReceive, g_origReceiveMap);
-                    pMip->Release();
-                }
-            }
-            FreeMediaType(mt);
-        }
-    }
-    return hr;
+HRESULT STDMETHODCALLTYPE HookedConnect(IGraphBuilder* pS, IPin* pO, IPin* pI) {
+    void** vt = *(void***)pS; HRESULT hr = g_origConnectMap[vt](pS, pO, pI);
+    if (SUCCEEDED(hr)) DoPatchPin(pI); return hr;
+}
+HRESULT STDMETHODCALLTYPE HookedConnectDirect(IFilterGraph* pS, IPin* pO, IPin* pI, const AM_MEDIA_TYPE* mt) {
+    void** vt = *(void***)pS; HRESULT hr = g_origConnectDirMap[vt](pS, pO, pI, mt);
+    if (SUCCEEDED(hr)) DoPatchPin(pI); return hr;
 }
 
 typedef HRESULT(WINAPI* PCoCreate)(REFCLSID, LPUNKNOWN, DWORD, REFIID, LPVOID*);
@@ -548,8 +537,48 @@ static PCoCreate g_origCoCreate = NULL;
 HRESULT WINAPI HookedCoCreate(REFCLSID clsid, LPUNKNOWN pU, DWORD ctx, REFIID riid, LPVOID* ppv) {
     HRESULT hr = g_origCoCreate(clsid, pU, ctx, riid, ppv);
     if (SUCCEEDED(hr) && ppv && *ppv) {
-        if (riid == IID_IGraphBuilder || riid == IID_IFilterGraph) {
-            PatchVTable(*ppv, 11, &HookedGraphConnect, g_origGraphConnectMap);
+        if (riid == IID_IGraphBuilder || riid == IID_IFilterGraph || clsid == CLSID_FilterGraph) {
+            PatchVTable(*ppv, 2, (void*)&HookedRelease, g_origReleaseMap);
+            PatchVTable(*ppv, 7, (void*)&HookedConnectDirect, g_origConnectDirMap);
+            PatchVTable(*ppv, 11, (void*)&HookedConnect, g_origConnectMap);
+        }
+    }
+    return hr;
+}
+
+typedef HRESULT(WINAPI* PMFCreateSR)(IMFMediaSource*, IMFAttributes*, IMFSourceReader**);
+static PMFCreateSR g_origMFCreateSR = NULL;
+HRESULT WINAPI HookedMFCreateSR(IMFMediaSource* pM, IMFAttributes* pA, IMFSourceReader** pS) {
+    HRESULT hr = g_origMFCreateSR(pM, pA, pS);
+    if (SUCCEEDED(hr) && pS && *pS) {
+        PatchVTable(*pS, 2, (void*)&HookedRelease, g_origReleaseMap);
+        PatchVTable(*pS, 7, (void*)&HookedSetCMT, g_origSetCMTMap);
+        PatchVTable(*pS, 9, (void*)&HookedReadSample, g_origReadSampleMap);
+        if (pA) {
+            IUnknown* pC = NULL; if (SUCCEEDED(pA->GetUnknown(MF_SOURCE_READER_ASYNC_CALLBACK, IID_IUnknown, (LPVOID*)&pC))) {
+                { std::lock_guard<std::mutex> lkMap(g_mfMapMutex); g_mfCallbackToReader[pC] = *pS; }
+                PatchVTable(pC, 2, (void*)&HookedRelease, g_origReleaseMap);
+                PatchVTable(pC, 3, (void*)&HookedOnReadSample, g_origOnReadSampleMap); pC->Release();
+            }
+        }
+    }
+    return hr;
+}
+
+typedef HRESULT(WINAPI* PMFCreateSRFromBS)(IMFByteStream*, IMFAttributes*, IMFSourceReader**);
+static PMFCreateSRFromBS g_origMFCreateSRFromBS = NULL;
+HRESULT WINAPI HookedMFCreateSRFromBS(IMFByteStream* pB, IMFAttributes* pA, IMFSourceReader** pS) {
+    HRESULT hr = g_origMFCreateSRFromBS(pB, pA, pS);
+    if (SUCCEEDED(hr) && pS && *pS) {
+        PatchVTable(*pS, 2, (void*)&HookedRelease, g_origReleaseMap);
+        PatchVTable(*pS, 7, (void*)&HookedSetCMT, g_origSetCMTMap);
+        PatchVTable(*pS, 9, (void*)&HookedReadSample, g_origReadSampleMap);
+        if (pA) {
+            IUnknown* pC = NULL; if (SUCCEEDED(pA->GetUnknown(MF_SOURCE_READER_ASYNC_CALLBACK, IID_IUnknown, (LPVOID*)&pC))) {
+                { std::lock_guard<std::mutex> lkMap(g_mfMapMutex); g_mfCallbackToReader[pC] = *pS; }
+                PatchVTable(pC, 2, (void*)&HookedRelease, g_origReleaseMap);
+                PatchVTable(pC, 3, (void*)&HookedOnReadSample, g_origOnReadSampleMap); pC->Release();
+            }
         }
     }
     return hr;
@@ -557,19 +586,24 @@ HRESULT WINAPI HookedCoCreate(REFCLSID clsid, LPUNKNOWN pU, DWORD ctx, REFIID ri
 
 extern "C" __declspec(dllexport) DWORD WINAPI StartWatch(LPVOID lp) {
     if (g_bInitialized.exchange(true)) return 0;
-    CheckProcessAndSetMirrorMode();
-    CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    CheckProcessAndSetMirrorMode(); CoInitializeEx(NULL, COINIT_MULTITHREADED);
     Gdiplus::GdiplusStartupInput gsi; Gdiplus::GdiplusStartup(&g_gdiplusToken, &gsi, NULL);
     CreateThread(NULL, 0, IpcClientThread, NULL, 0, NULL);
     if (MH_Initialize() == MH_OK) {
         HMODULE hO = GetModuleHandleW(L"ole32.dll"); if (hO) MH_CreateHook((void*)GetProcAddress(hO, "CoCreateInstance"), &HookedCoCreate, (LPVOID*)&g_origCoCreate);
         HMODULE hM = GetModuleHandleW(L"Mfreadwrite.dll"); if (!hM) hM = LoadLibraryW(L"Mfreadwrite.dll");
         if (hM) {
-            void* p1 = (void*)GetProcAddress(hM, "MFCreateSourceReaderFromMediaSource");
-            if (p1) MH_CreateHook(p1, &HookedMFCreateSR, (LPVOID*)&g_origMFCreateSR);
+            MH_CreateHook((void*)GetProcAddress(hM, "MFCreateSourceReaderFromMediaSource"), &HookedMFCreateSR, (LPVOID*)&g_origMFCreateSR);
+            MH_CreateHook((void*)GetProcAddress(hM, "MFCreateSourceReaderFromByteStream"), &HookedMFCreateSRFromBS, (LPVOID*)&g_origMFCreateSRFromBS);
         }
         MH_EnableHook(MH_ALL_HOOKS);
     }
     return 0;
 }
-BOOL APIENTRY DllMain(HMODULE h, DWORD r, LPVOID) { if (r == DLL_PROCESS_ATTACH) { DisableThreadLibraryCalls(h); g_hModule = h; } return TRUE; }
+
+BOOL APIENTRY DllMain(HMODULE h, DWORD r, LPVOID) {
+    if (r == DLL_PROCESS_ATTACH) { 
+        DisableThreadLibraryCalls(h); g_hModule = h; 
+        CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)StartWatch, NULL, 0, NULL);
+    } return TRUE; 
+}
