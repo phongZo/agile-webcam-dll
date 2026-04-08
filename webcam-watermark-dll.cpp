@@ -102,6 +102,9 @@ static std::mutex g_mfMapMutex;
 static HANDLE g_hWatermarkMap = NULL;
 static BYTE* g_pWatermarkBuffer = NULL;
 static int g_watermarkW = 0, g_watermarkH = 0;
+static bool g_watermarkEnabled = true;
+static bool g_cpDrawingEnabled = true;
+static bool g_isBypass = false;
 static std::mutex g_sharedMemMutex;
 
 static void CleanupSharedWatermark() {
@@ -109,6 +112,9 @@ static void CleanupSharedWatermark() {
     if (g_pWatermarkBuffer) { UnmapViewOfFile(g_pWatermarkBuffer); g_pWatermarkBuffer = NULL; }
     if (g_hWatermarkMap) { CloseHandle(g_hWatermarkMap); g_hWatermarkMap = NULL; }
     g_watermarkW = 0; g_watermarkH = 0;
+    g_watermarkEnabled = false;
+    g_cpDrawingEnabled = false;
+    g_isBypass = true;
 }
 
 static std::wstring Utf8ToUtf16(const std::string& s) {
@@ -118,13 +124,21 @@ static std::wstring Utf8ToUtf16(const std::string& s) {
     return ws;
 }
 
-static void UpdateSharedWatermarkBuffer(const std::wstring& name, int w, int h) {
+static void UpdateSharedWatermarkBuffer(const std::wstring& name, int w, int h, bool enabled, bool cpEnabled, bool bypass) {
+    std::lock_guard<std::mutex> lock(g_sharedMemMutex);
+    g_watermarkEnabled = enabled;
+    g_cpDrawingEnabled = cpEnabled;
+    g_isBypass = bypass;
+
     if (name.empty() || w <= 0 || h <= 0) { 
-        CleanupSharedWatermark(); 
+        if (g_watermarkW == w && g_watermarkH == h && !name.empty()) return;
+        
+        if (g_pWatermarkBuffer) { UnmapViewOfFile(g_pWatermarkBuffer); g_pWatermarkBuffer = NULL; }
+        if (g_hWatermarkMap) { CloseHandle(g_hWatermarkMap); g_hWatermarkMap = NULL; }
+        g_watermarkW = 0; g_watermarkH = 0;
         return; 
     }
     
-    std::lock_guard<std::mutex> lock(g_sharedMemMutex);
     if (g_hWatermarkMap != NULL && g_watermarkW == w && g_watermarkH == h) return;
 
     if (g_pWatermarkBuffer) { UnmapViewOfFile(g_pWatermarkBuffer); g_pWatermarkBuffer = NULL; }
@@ -282,6 +296,10 @@ void SoftwareBlendI420(BYTE* pData, int width, int height, int stride, const BYT
 
 static void ProcessWatermarkInternal(BYTE* pData, int width, int height, int formatType, int stride, bool isCompressed) {
     if (isCompressed || !pData || width <= 0 || height <= 0) return;
+    
+    // Logic: ONLY blend if watermark is enabled (calculated by Producer)
+    if (!g_watermarkEnabled) return;
+
     std::lock_guard<std::mutex> shmLock(g_sharedMemMutex);
     if (g_pWatermarkBuffer && g_watermarkW > 0 && g_watermarkH > 0) {
         if (formatType == 3) {
@@ -360,11 +378,14 @@ static void ProcessPipeLineBuffer(std::string& buffer) {
         try {
             auto j = json::parse(line);
             std::string cmd = j.value("CMD", "");
-            if (cmd == "UpdateBitmapShared") {
+            if (cmd == "UpdateBitmapShared" || cmd == "UpdateProfileConfig" || cmd == "InitIPC") {
                 std::string shmName = j.value("SharedMemoryName", "");
                 int w = j.value("Width", 0);
                 int h = j.value("Height", 0);
-                UpdateSharedWatermarkBuffer(Utf8ToUtf16(shmName), w, h);
+                bool enabled = j.value("WebcamWatermark", true);
+                bool cpEnabled = j.value("DrawingEnabled", true);
+                bool bypass = j.value("IsBypass", false);
+                UpdateSharedWatermarkBuffer(Utf8ToUtf16(shmName), w, h, enabled, cpEnabled, bypass);
             }
         } catch (...) {}
     }
