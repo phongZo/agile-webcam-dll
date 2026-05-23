@@ -64,16 +64,7 @@ static void CheckProcessAndSetMirrorMode() {
         std::wstring wsPath(path);
         std::transform(wsPath.begin(), wsPath.end(), wsPath.begin(), ::towlower);
 
-        // Mirror for Zoom and Teams (both old and new versions)
-        if (wsPath.find(L"zoom.exe") != std::wstring::npos ||
-            wsPath.find(L"teams.exe") != std::wstring::npos) {
-            g_isMirrorMode = true;
-            DebugLog::log("[WebcamDLL] Mirror Mode ENABLED for target process.");
-        }
-        else {
-            g_isMirrorMode = false;
-            DebugLog::log("[WebcamDLL] Mirror Mode DISABLED for target process.");
-        }
+        g_isMirrorMode = false;
     }
 }
 
