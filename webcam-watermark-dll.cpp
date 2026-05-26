@@ -64,16 +64,7 @@ static void CheckProcessAndSetMirrorMode() {
         std::wstring wsPath(path);
         std::transform(wsPath.begin(), wsPath.end(), wsPath.begin(), ::towlower);
 
-        // Mirror for Zoom and Teams (both old and new versions)
-        if (wsPath.find(L"zoom.exe") != std::wstring::npos ||
-            wsPath.find(L"teams.exe") != std::wstring::npos) {
-            g_isMirrorMode = true;
-            DebugLog::log("[WebcamDLL] Mirror Mode ENABLED for target process.");
-        }
-        else {
-            g_isMirrorMode = false;
-            DebugLog::log("[WebcamDLL] Mirror Mode DISABLED for target process.");
-        }
+        g_isMirrorMode = false;
     }
 }
 
@@ -297,8 +288,8 @@ void SoftwareBlendI420(BYTE* pData, int width, int height, int stride, const BYT
 static void ProcessWatermarkInternal(BYTE* pData, int width, int height, int formatType, int stride, bool isCompressed) {
     if (isCompressed || !pData || width <= 0 || height <= 0) return;
     
-    // Logic: ONLY blend if watermark is enabled (calculated by Producer)
-    if (!g_watermarkEnabled) return;
+    // Logic: ONLY blend if webcam watermark is enabled, drawing is enabled, and bypass is off.
+    if (!g_watermarkEnabled || !g_cpDrawingEnabled || g_isBypass) return;
 
     std::lock_guard<std::mutex> shmLock(g_sharedMemMutex);
     if (g_pWatermarkBuffer && g_watermarkW > 0 && g_watermarkH > 0) {

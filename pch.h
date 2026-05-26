@@ -7,7 +7,7 @@
 
 #include "framework.h"
 #include <windows.h>
-#include <objidl.h> // Để định nghĩa IStream cho Gdiplus
+#include <objidl.h> // To define IStream for Gdiplus
 #include <gdiplus.h>
 #include <string>
 #include <mutex>
