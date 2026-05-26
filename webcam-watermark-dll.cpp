@@ -288,8 +288,8 @@ void SoftwareBlendI420(BYTE* pData, int width, int height, int stride, const BYT
 static void ProcessWatermarkInternal(BYTE* pData, int width, int height, int formatType, int stride, bool isCompressed) {
     if (isCompressed || !pData || width <= 0 || height <= 0) return;
     
-    // Logic: ONLY blend if watermark is enabled (calculated by Producer)
-    if (!g_watermarkEnabled) return;
+    // Logic: ONLY blend if webcam watermark is enabled, drawing is enabled, and bypass is off.
+    if (!g_watermarkEnabled || !g_cpDrawingEnabled || g_isBypass) return;
 
     std::lock_guard<std::mutex> shmLock(g_sharedMemMutex);
     if (g_pWatermarkBuffer && g_watermarkW > 0 && g_watermarkH > 0) {
