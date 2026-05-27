@@ -17,7 +17,9 @@
 #include "DebugLog.h"
 #include "packages/minhook.1.3.3/lib/native/include/MinHook.h"
 #include "packages/nlohmann.json.3.12.0/build/native/include/nlohmann/json.hpp"
+#include "FrameProcessGuard.h"
 #include "JpegHelper.h"
+#include "MjpgFrameGuard.h"
 
 #pragma comment(lib, "strmiids.lib")
 #pragma comment(lib, "ole32.lib")
@@ -68,12 +70,7 @@ static void CheckProcessAndSetMirrorMode() {
     }
 }
 
-struct BufferTag { 
-    DWORD timestamp;  
-    int sourceId; // 0 for Media Foundation, 1 for DirectShow
-};
-static std::map<void*, BufferTag> g_processedRawBuffers;
-static std::mutex g_rawBufferMutex;
+static FrameProcessGuard g_frameProcessGuard;
 
 enum VideoFormatType { VF_YUY2 = 0, VF_NV12 = 1, VF_BGRA = 2, VF_I420 = 3, VF_UNKNOWN = -1 };
 struct VideoConfig {
@@ -151,20 +148,8 @@ static void UpdateSharedWatermarkBuffer(const std::wstring& name, int w, int h, 
 static const wchar_t* kPipeInject = L"\\\\.\\pipe\\AgileMarkPipe_qaKOab5VPyK4ar4A6sfm2VZ0";
 
 // --- Anti-Double Exposure ---
-bool IsRawFrameAlreadyProcessed(void* pData, int sourceId) {
-    if (!pData) return false;
-    DWORD now = GetTickCount();
-    std::lock_guard<std::mutex> lock(g_rawBufferMutex);
-
-    auto it = g_processedRawBuffers.find(pData);
-    if (it != g_processedRawBuffers.end()) {
-        if (it->second.sourceId != sourceId && (now - it->second.timestamp < 15)) {
-            return true;
-        }
-    }
-
-    g_processedRawBuffers[pData] = { now, sourceId };
-    return false;
+bool IsRawFrameAlreadyProcessed(void* pData, int sourceId, LONGLONG sampleTime) {
+    return g_frameProcessGuard.HasSeenFrame(pData, sourceId, sampleTime, GetTickCount());
 }
 
 // --- Blending & YUV BT.709 Limited Range Helpers ---
@@ -446,10 +431,14 @@ ULONG STDMETHODCALLTYPE HookedRelease(IUnknown* pThis) {
     return ref;
 }
 
-void ProcessMFSample(void* r, IMFSample* pS, DWORD di) {
+void ProcessMFSample(void* r, IMFSample* pS, DWORD di, LONGLONG hookSampleTime) {
     if (!pS) return;
     IMFMediaBuffer* pB = NULL; if (SUCCEEDED(pS->ConvertToContiguousBuffer(&pB))) {
         BYTE* pD = NULL; DWORD maxL=0, curL=0; if (SUCCEEDED(pB->Lock(&pD, &maxL, &curL))) {
+            LONGLONG sampleTime = hookSampleTime;
+            if (sampleTime == FrameProcessGuard::kUnknownSampleTime) {
+                pS->GetSampleTime(&sampleTime);
+            }
             VideoConfig c; { 
                 std::lock_guard<std::mutex> lk(g_cfgMutex); 
                 if (g_videoConfigs.count(r)) {
@@ -460,9 +449,9 @@ void ProcessMFSample(void* r, IMFSample* pS, DWORD di) {
                 }
             }
             if (c.width == 0) { c.width=640; c.height=480; }
-            bool pMJ = (curL > 30 && pD[2] == 0xFF && pD[3] == 0xFE && pD[6] == 'A');
+            bool pMJ = HasAgileMarkJpegSignature(pD, curL);
             if (c.isCompressed && !pMJ) ProcessMJPGFrame(pD, curL, maxL, pB, NULL);
-            else if (!c.isCompressed && !IsRawFrameAlreadyProcessed(pD, 0)) {
+            else if (!c.isCompressed && !IsRawFrameAlreadyProcessed(pD, 0, sampleTime)) {
                 if (c.subtype == MEDIASUBTYPE_I420 && c.height > 0) ProcessWatermarkInternal(pD, c.width, c.height, 3, (curL * 2) / (c.height * 3), false);
                 else {
                     DWORD exp = c.isNV12 ? (c.width * c.height * 3 / 2) : (c.width * c.height * 2);
@@ -481,13 +470,13 @@ void ProcessMFSample(void* r, IMFSample* pS, DWORD di) {
 HRESULT STDMETHODCALLTYPE HookedReadSample(IMFSourceReader* pS, DWORD di, DWORD df, DWORD* ad, DWORD* sf, LONGLONG* ts, IMFSample** sa) {
     void** vt = *(void***)pS; PReadSample orig = g_origReadSampleMap[vt];
     HRESULT hr = orig(pS, di, df, ad, sf, ts, sa);
-    if (SUCCEEDED(hr) && sa && *sa) ProcessMFSample(pS, *sa, di); return hr;
+    if (SUCCEEDED(hr) && sa && *sa) ProcessMFSample(pS, *sa, di, ts ? *ts : FrameProcessGuard::kUnknownSampleTime); return hr;
 }
 
 HRESULT STDMETHODCALLTYPE HookedOnReadSample(IMFSourceReaderCallback* pC, HRESULT hr, DWORD di, DWORD df, LONGLONG ts, IMFSample* sa) {
     if (SUCCEEDED(hr) && sa) {
         void* pR = nullptr; { std::lock_guard<std::mutex> lk(g_mfMapMutex); if (g_mfCallbackToReader.count(pC)) pR = g_mfCallbackToReader[pC]; }
-        if (pR) ProcessMFSample(pR, sa, di);
+        if (pR) ProcessMFSample(pR, sa, di, ts);
     }
     void** vt = *(void***)pC; return g_origOnReadSampleMap[vt](pC, hr, di, df, ts, sa);
 }
@@ -497,7 +486,7 @@ HRESULT STDMETHODCALLTYPE HookedSetCMT(IMFSourceReader* pS, DWORD di, DWORD* pr,
         VideoConfig c; UINT32 w, h; MFGetAttributeSize(pT, MF_MT_FRAME_SIZE, &w, &h);
         if (w>0) { 
             c.width=w; c.height=h; GUID sub; pT->GetGUID(MF_MT_SUBTYPE, &sub); c.subtype = sub;
-            c.isNV12 = (sub == MEDIASUBTYPE_NV12); c.isCompressed = (sub == MEDIASUBTYPE_MJPG);
+            c.isNV12 = (sub == MEDIASUBTYPE_NV12); c.isCompressed = IsMjpgSubtype(sub);
             { std::lock_guard<std::mutex> lk(g_cfgMutex); g_videoConfigs[pS] = c; g_lastKnownConfig = c; }
         }
     }
@@ -508,8 +497,18 @@ HRESULT STDMETHODCALLTYPE HookedReceive(IMemInputPin* pS, IMediaSample* pM) {
     if (pM) {
         BYTE* pB = NULL; if (SUCCEEDED(pM->GetPointer(&pB))) {
             VideoConfig c; { std::lock_guard<std::mutex> lk(g_cfgMutex); c = g_videoConfigs.count(pS) ? g_videoConfigs[pS] : g_lastKnownConfig; }
-            if (c.width > 0 && !IsRawFrameAlreadyProcessed(pB, 1)) {
-                if (c.subtype == MEDIASUBTYPE_I420 && c.height > 0) ProcessWatermarkInternal(pB, c.width, c.height, 3, (pM->GetActualDataLength() * 2) / (c.height * 3), false);
+            LONGLONG sampleTime = FrameProcessGuard::kUnknownSampleTime;
+            LONGLONG sampleEnd = 0;
+            pM->GetTime(&sampleTime, &sampleEnd);
+            if (c.width > 0 && !IsRawFrameAlreadyProcessed(pB, 1, sampleTime)) {
+                if (c.isCompressed) {
+                    long actualLen = pM->GetActualDataLength();
+                    long maxLen = pM->GetSize();
+                    if (actualLen > 0 && maxLen >= actualLen && !HasAgileMarkJpegSignature(pB, (DWORD)actualLen)) {
+                        ProcessMJPGFrame(pB, (DWORD)actualLen, (DWORD)maxLen, NULL, pM);
+                    }
+                }
+                else if (c.subtype == MEDIASUBTYPE_I420 && c.height > 0) ProcessWatermarkInternal(pB, c.width, c.height, 3, (pM->GetActualDataLength() * 2) / (c.height * 3), false);
                 else {
                     int stride = c.isNV12 ? c.width : ((c.width * 2 + 15) & ~15);
                     ProcessWatermarkInternal(pB, c.width, c.height, c.isNV12 ? 1 : 0, stride, false);
@@ -526,6 +525,7 @@ void DoPatchPin(IPin* pI) {
         VIDEOINFOHEADER* vih = (VIDEOINFOHEADER*)mt.pbFormat;
         cfg.width = vih->bmiHeader.biWidth; cfg.height = abs(vih->bmiHeader.biHeight);
         cfg.subtype = mt.subtype; cfg.isNV12 = (mt.subtype == MEDIASUBTYPE_NV12);
+        cfg.isCompressed = IsMjpgSubtype(mt.subtype);
     }
     IMemInputPin* pM = nullptr; if (SUCCEEDED(pI->QueryInterface(IID_IMemInputPin, (void**)&pM))) {
         { std::lock_guard<std::mutex> lk(g_cfgMutex); g_videoConfigs[pM] = cfg; }
